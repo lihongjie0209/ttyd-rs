@@ -1,0 +1,13 @@
+/target
+/.playwright-cli
+/.idea
+/.vscode
+*.log
+
+# Frontend
+frontend/node_modules
+frontend/dist
+
+# Build outputs / temp
+coverage
+*.tmp

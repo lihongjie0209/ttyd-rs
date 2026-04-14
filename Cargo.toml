@@ -1,0 +1,50 @@
+[package]
+name = "ttyd-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ttyd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+flate2 = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+open = "5"
+portable-pty = "0.8"
+futures-util = "0.3"
+bytes = "1"
+hostname = "0.4"
+anyhow = "1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+hyper-util = { version = "0.1", features = ["server", "http1", "http2", "tokio"] }
+ipnet = "2"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+subtle = "2.6"
+
+[build-dependencies]
+flate2 = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true
