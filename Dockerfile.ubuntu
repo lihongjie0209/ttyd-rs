@@ -1,0 +1,79 @@
+# ── Stage 1: Build ttyd binary ──────────────────────────────────────────────
+FROM rust:1-bookworm AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY frontend ./frontend
+
+RUN cargo build --release
+
+# ── Stage 2: Runtime image ───────────────────────────────────────────────────
+FROM mcr.microsoft.com/devcontainers/base:ubuntu
+
+USER root
+
+# Replace apt sources with Aliyun mirror (speeds up installs inside China)
+RUN . /etc/os-release \
+    && sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g" \
+        -e "s|http://ports.ubuntu.com/ubuntu-ports|https://mirrors.aliyun.com/ubuntu-ports|g" \
+        /etc/apt/sources.list 2>/dev/null || true \
+    && find /etc/apt/sources.list.d/ -name "*.list" -exec sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g" \
+        {} \;
+
+# Install common developer tools + lrzsz for file transfer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # editors
+    vim nano \
+    # shell & completion
+    zsh bash-completion \
+    # file utilities
+    tree file zip unzip tar gzip \
+    lrzsz \
+    # network
+    curl wget \
+    net-tools iputils-ping dnsutils \
+    openssh-client telnet \
+    # process / system
+    htop procps lsof strace \
+    # dev tools
+    git jq \
+    python3 python3-pip \
+    build-essential pkg-config \
+    # search
+    ripgrep fd-find \
+    # misc
+    less man-db locales \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && locale-gen en_US.UTF-8
+
+# pip mirrors (Aliyun)
+RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
+    && pip3 config set install.trusted-host mirrors.aliyun.com 2>/dev/null || true
+
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+WORKDIR /workspace
+
+COPY --from=builder /app/target/release/ttyd /usr/local/bin/ttyd
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 7681
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["bash"]

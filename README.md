@@ -65,17 +65,153 @@ cargo build --release
 
 ## Docker
 
+### Minimal image (`Dockerfile`)
+
 ```bash
 docker build -t ttyd-rs:latest .
 
 # No auth
-docker run --rm -p 7681:7681 ttyd-rs:latest bash
+docker run --rm -p 7681:7681 ttyd-rs:latest
 
-# With auth via TTYD_ARGS
-docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" ttyd-rs:latest bash
+# With auth (via TTYD_ARGS)
+docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" ttyd-rs:latest
 ```
 
-The `docker-entrypoint.sh` reads `TTYD_ARGS` and prepends them to the command, so you can configure the server entirely via environment variables.
+### Full Ubuntu image (`Dockerfile.ubuntu`)
+
+Pre-installed: vim, zsh, git, curl, wget, htop, jq, python3, ripgrep, lrzsz, and more. Apt/pip are configured with Aliyun mirrors for fast installs in China.
+
+```bash
+docker build -f Dockerfile.ubuntu -t ttyd-rs-ubuntu:latest .
+docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" ttyd-rs-ubuntu:latest
+
+# Or pull from DockerHub
+docker pull lihongjie0209/ttyd-rs-ubuntu:latest
+docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" lihongjie0209/ttyd-rs-ubuntu:latest
+```
+
+The `docker-entrypoint.sh` reads `TTYD_ARGS` and prepends them to the command.
+
+## Nginx Reverse Proxy
+
+ttyd-rs uses WebSocket (with optional Noise encryption) and needs proper proxy headers. Below are common nginx configurations.
+
+### Basic HTTP proxy
+
+```nginx
+server {
+    listen 80;
+    server_name terminal.example.com;
+
+    location / {
+        proxy_pass         http://127.0.0.1:7681;
+        proxy_http_version 1.1;
+
+        # WebSocket upgrade
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Pass real client info
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeouts — keep WS alive
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+    }
+}
+```
+
+### HTTPS + WSS (recommended for production)
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name terminal.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass         http://127.0.0.1:7681;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+    }
+}
+
+# Redirect HTTP → HTTPS
+server {
+    listen 80;
+    server_name terminal.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+### Sub-path proxy (`--base-path`)
+
+Start ttyd-rs with `--base-path /ttyd`:
+
+```bash
+ttyd --base-path /ttyd -c admin:admin bash
+```
+
+Then proxy only that prefix in nginx:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name example.com;
+
+    # ... other locations ...
+
+    location /ttyd/ {
+        proxy_pass         http://127.0.0.1:7681/ttyd/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+    }
+}
+```
+
+### Proxy auth header
+
+If nginx handles authentication and you want to pass the username to ttyd-rs, start with `--auth-header X-Remote-User`:
+
+```nginx
+location / {
+    # ... your nginx auth ...
+    proxy_set_header X-Remote-User $remote_user;
+    proxy_pass http://127.0.0.1:7681;
+    # ... ws headers ...
+}
+```
+
+```bash
+ttyd --auth-header X-Remote-User bash
+```
 
 ## Integration Tests
 
