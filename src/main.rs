@@ -15,7 +15,7 @@ use axum::{
     extract::{ConnectInfo, Json, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use clap::Parser;
@@ -270,14 +270,6 @@ fn build_state(
         use base64::{engine::general_purpose::STANDARD, Engine};
         STANDARD.encode(c.as_bytes())
     });
-    let session_token = credential.as_ref().map(|_| {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-        use rand_core::RngCore;
-        let mut bytes = [0u8; 32];
-        rand_core::OsRng.fill_bytes(&mut bytes);
-        URL_SAFE_NO_PAD.encode(bytes)
-    });
-
     let mut prefs: Map<String, Value> = Map::new();
     #[cfg(windows)]
     prefs.insert("isWindows".to_string(), Value::Bool(true));
@@ -296,6 +288,7 @@ fn build_state(
             ws: format!("{}/ws", b),
             index: format!("{}/", b),
             login: format!("{}/login", b),
+            logout: format!("{}/logout", b),
             parent: b.to_string(),
         }
     } else {
@@ -324,7 +317,9 @@ fn build_state(
         srv_buf_size: cli.srv_buf_size.max(128),
         lrzsz_supported,
         ws_noise: !cli.disable_ws_noise,
-        session_token,
+        token_store: std::sync::Mutex::new(std::collections::HashMap::new()),
+        login_limiter: std::sync::Mutex::new(std::collections::HashMap::new()),
+        tls_enabled: cli.ssl_cert.is_some(),
         audit_logger,
         ip_whitelist,
         endpoints,
@@ -380,7 +375,19 @@ async fn route_login_post(
     if !state.is_ip_allowed(client_ip) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    http::login_submit(State(state), Json(payload)).await
+    http::login_submit(State(state), client_ip, Json(payload)).await
+}
+
+async fn route_logout_post(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
+) -> impl IntoResponse {
+    let client_ip = peer.map(|p| p.0.ip());
+    if !state.is_ip_allowed(client_ip) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    http::logout(State(state), headers).await
 }
 
 fn make_addr(cli: &Cli) -> anyhow::Result<SocketAddr> {
@@ -506,9 +513,11 @@ async fn main() -> anyhow::Result<()> {
 
     let ws_path = state.endpoints.ws.clone();
     let login_path = state.endpoints.login.clone();
+    let logout_path = state.endpoints.logout.clone();
     let app = Router::new()
         .route(&ws_path, get(route_ws))
         .route(&login_path, get(route_login_get).post(route_login_post))
+        .route(&logout_path, post(route_logout_post))
         .fallback(route_http)
         .with_state(state.clone());
 

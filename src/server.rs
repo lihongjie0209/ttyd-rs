@@ -1,9 +1,30 @@
 use crate::audit::AuditLogger;
 use ipnet::IpNet;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::AtomicI32;
-use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
+
+/// Token lifetime in seconds (24 h)
+pub const TOKEN_TTL_SECS: u64 = 86_400;
+/// Number of consecutive failures before an IP is locked
+pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
+/// Lock-out duration in seconds (15 min)
+pub const LOGIN_LOCKOUT_SECS: u64 = 900;
+
+/// An active session token stored server-side
+pub struct TokenEntry {
+    pub username: String,
+    pub expires_at: Instant,
+}
+
+/// Per-IP login attempt state
+pub struct LoginAttempts {
+    pub count: u32,
+    pub locked_until: Option<Instant>,
+}
 
 /// URL endpoint paths, configurable via --base-path
 #[derive(Clone, Debug)]
@@ -11,6 +32,7 @@ pub struct Endpoints {
     pub ws: String,
     pub index: String,
     pub login: String,
+    pub logout: String,
     pub parent: String,
 }
 
@@ -20,6 +42,7 @@ impl Default for Endpoints {
             ws: "/ws".to_string(),
             index: "/".to_string(),
             login: "/login".to_string(),
+            logout: "/logout".to_string(),
             parent: String::new(),
         }
     }
@@ -69,8 +92,12 @@ pub struct ServerState {
     pub lrzsz_supported: bool,
     /// Whether to protect WS payloads with Noise transport encryption
     pub ws_noise: bool,
-    /// Optional browser session token for login-page auth flow
-    pub session_token: Option<String>,
+    /// Active session tokens: token → TokenEntry (expiry + username)
+    pub token_store: StdMutex<HashMap<String, TokenEntry>>,
+    /// Per-IP login attempt tracking for brute-force protection
+    pub login_limiter: StdMutex<HashMap<IpAddr, LoginAttempts>>,
+    /// Whether the server is listening with TLS (used to set Secure cookie flag)
+    pub tls_enabled: bool,
     /// Optional JSONL audit log sink
     pub audit_logger: Option<Arc<AuditLogger>>,
     /// Allowed client IP/CIDR list; empty means allow all

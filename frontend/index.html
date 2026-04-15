@@ -154,6 +154,16 @@
             background: #4a90d9;
             border-radius: 0 2px 2px 0;
         }
+        #file-tree li.drag-over {
+            background: rgba(74, 158, 255, 0.2);
+            outline: 1px dashed #4a9eff;
+            outline-offset: -2px;
+        }
+        #file-tree.drag-over-root {
+            background: rgba(74, 158, 255, 0.08);
+            outline: 1.5px dashed #4a9eff;
+            outline-offset: -3px;
+        }
         .tree-row-inner {
             display: flex;
             align-items: center;
@@ -338,6 +348,7 @@
                         <button id="file-download-btn">下载</button>
                         <button id="file-rename-btn">重命名</button>
                         <button id="file-delete-btn">删除</button>
+                        <button id="logout-btn" style="color:#ff8b8b">退出登录</button>
                     </div>
                 </div>
             </div>

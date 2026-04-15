@@ -8,13 +8,16 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::fs;
 use tracing::info;
 
 use crate::assets;
 use crate::audit::AuditEvent;
-use crate::server::SharedState;
+use crate::server::{
+    LoginAttempts, SharedState, TokenEntry, LOGIN_LOCKOUT_SECS, LOGIN_MAX_ATTEMPTS, TOKEN_TTL_SECS,
+};
 
 const SESSION_COOKIE_NAME: &str = "ttyd_session";
 
@@ -27,6 +30,23 @@ struct TokenResponse {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+}
+
+/// Extract the raw session token from either `Authorization: Bearer <tok>` or the session cookie.
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    // Bearer header takes priority
+    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = auth.strip_prefix("Bearer ") {
+            return Some(tok.to_string());
+        }
+    }
+    // Fall back to session cookie
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        if let Some(val) = parse_cookie_value(cookie, SESSION_COOKIE_NAME) {
+            return Some(val);
+        }
+    }
+    None
 }
 
 fn accepts_gzip(headers: &HeaderMap) -> bool {
@@ -106,6 +126,7 @@ fn parse_cookie_value(cookie_header: &str, key: &str) -> Option<String> {
 
 /// Returns Some(username) if authenticated, None if rejected.
 pub fn check_auth(headers: &HeaderMap, state: &SharedState) -> Option<String> {
+    // Proxy-header auth (e.g. X-Remote-User set by nginx)
     if let Some(auth_header_name) = &state.auth_header {
         let name_lower = auth_header_name.to_lowercase();
         for (k, v) in headers.iter() {
@@ -115,33 +136,25 @@ pub fn check_auth(headers: &HeaderMap, state: &SharedState) -> Option<String> {
         }
         return None;
     }
-    if let Some(session_token) = &state.session_token {
-        // Accept Bearer token in Authorization header
-        let auth_value = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if let Some(bearer) = auth_value.strip_prefix("Bearer ") {
-            if bool::from(bearer.as_bytes().ct_eq(session_token.as_bytes())) {
-                return Some("token".to_string());
-            }
+
+    // Token-based auth
+    if state.credential.is_some() {
+        let token = match extract_bearer(headers) {
+            Some(t) => t,
+            None => return None,
+        };
+        let mut store = state.token_store.lock().unwrap();
+        let entry = store.get(&token)?;
+        if Instant::now() >= entry.expires_at {
+            // Expired: evict and deny
+            let token_clone = token.clone();
+            store.remove(&token_clone);
             return None;
         }
-        // Accept session cookie
-        if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-            if let Some(cookie_val) = parse_cookie_value(cookie_header, SESSION_COOKIE_NAME) {
-                if bool::from(cookie_val.as_bytes().ct_eq(session_token.as_bytes())) {
-                    return Some("session".to_string());
-                }
-            }
-        }
-        return None;
+        return Some(entry.username.clone());
     }
+
     // No auth configured → allow all
-    if state.credential.is_some() {
-        // credential present but session_token is None: server misconfiguration, deny
-        return None;
-    }
     Some(String::new())
 }
 
@@ -166,6 +179,7 @@ pub async fn login_page(State(state): State<SharedState>) -> Response {
 
 pub async fn login_submit(
     State(state): State<SharedState>,
+    client_ip: Option<IpAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
     let Some(credential) = state.credential.as_ref() else {
@@ -175,12 +189,39 @@ pub async fn login_submit(
             .body(Body::empty())
             .unwrap();
     };
+
+    // sec-1: rate-limit check
+    if let Some(ip) = client_ip {
+        let limiter = state.login_limiter.lock().unwrap();
+        if let Some(entry) = limiter.get(&ip) {
+            if let Some(locked_until) = entry.locked_until {
+                if Instant::now() < locked_until {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header(header::CONTENT_TYPE, "text/plain")
+                        .body(Body::from("Too many login attempts. Try again later."))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     let expected = STANDARD.encode(format!("{}:{}", req.username, req.password).as_bytes());
     if !bool::from(expected.as_bytes().ct_eq(credential.as_bytes())) {
+        // sec-1: increment failure counter
+        if let Some(ip) = client_ip {
+            let mut limiter = state.login_limiter.lock().unwrap();
+            let entry = limiter.entry(ip).or_insert(LoginAttempts { count: 0, locked_until: None });
+            entry.count += 1;
+            if entry.count >= LOGIN_MAX_ATTEMPTS {
+                entry.locked_until =
+                    Some(Instant::now() + Duration::from_secs(LOGIN_LOCKOUT_SECS));
+            }
+        }
         if let Some(logger) = &state.audit_logger {
             logger.log(AuditEvent::new(
                 req.username.clone(),
-                None,
+                client_ip.map(|ip| ip.to_string()),
                 "login",
                 None,
                 None,
@@ -194,26 +235,45 @@ pub async fn login_submit(
             .body(Body::empty())
             .unwrap();
     }
-    let Some(session_token) = state.session_token.as_ref() else {
-        return Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header(header::CONTENT_LENGTH, "0")
-            .body(Body::empty())
-            .unwrap();
+
+    // sec-1: clear failure counter on success
+    if let Some(ip) = client_ip {
+        state.login_limiter.lock().unwrap().remove(&ip);
+    }
+
+    // sec-2: issue a fresh token with expiry; also prune expired tokens
+    let token = {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use rand_core::RngCore;
+        let mut raw = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut raw);
+        URL_SAFE_NO_PAD.encode(raw)
     };
+    let expires_at = Instant::now() + Duration::from_secs(TOKEN_TTL_SECS);
+    {
+        let mut store = state.token_store.lock().unwrap();
+        // Prune expired entries
+        let now = Instant::now();
+        store.retain(|_, e| e.expires_at > now);
+        store.insert(token.clone(), TokenEntry { username: req.username.clone(), expires_at });
+    }
+
     let cookie_path = if state.endpoints.parent.is_empty() {
         "/".to_string()
     } else {
         state.endpoints.parent.clone()
     };
+    // sec-4: add Secure flag when running over TLS
+    let secure_flag = if state.tls_enabled { "; Secure" } else { "" };
     let cookie = format!(
-        "{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age=86400",
-        SESSION_COOKIE_NAME, session_token, cookie_path
+        "{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}{}",
+        SESSION_COOKIE_NAME, token, cookie_path, TOKEN_TTL_SECS, secure_flag
     );
+
     if let Some(logger) = &state.audit_logger {
         logger.log(AuditEvent::new(
             req.username,
-            None,
+            client_ip.map(|ip| ip.to_string()),
             "login",
             None,
             None,
@@ -221,14 +281,35 @@ pub async fn login_submit(
             None,
         ));
     }
-    let body = serde_json::to_string(&TokenResponse { token: session_token.clone() })
-        .unwrap_or_default();
+    let body = serde_json::to_string(&TokenResponse { token }).unwrap_or_default();
     Response::builder()
         .status(StatusCode::OK)
         .header(header::SET_COOKIE, cookie)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, body.len().to_string())
         .body(Body::from(body))
+        .unwrap()
+}
+
+/// sec-3: Logout — revoke the current session token and clear the cookie.
+pub async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Some(token) = extract_bearer(&headers) {
+        state.token_store.lock().unwrap().remove(&token);
+    }
+    let cookie_path = if state.endpoints.parent.is_empty() {
+        "/".to_string()
+    } else {
+        state.endpoints.parent.clone()
+    };
+    let clear_cookie = format!(
+        "{}=; Path={}; HttpOnly; SameSite=Lax; Max-Age=0",
+        SESSION_COOKIE_NAME, cookie_path
+    );
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::SET_COOKIE, clear_cookie)
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
         .unwrap()
 }
 
@@ -349,8 +430,9 @@ mod tests {
     use crate::server::{Endpoints, ServerState};
     use axum::body::to_bytes;
     use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicI32;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
     fn test_state() -> SharedState {
@@ -376,7 +458,9 @@ mod tests {
             srv_buf_size: 4096,
             lrzsz_supported: false,
             ws_noise: false,
-            session_token: None,
+            token_store: StdMutex::new(HashMap::new()),
+            login_limiter: StdMutex::new(HashMap::new()),
+            tls_enabled: false,
             audit_logger: None,
             ip_whitelist: vec![],
             endpoints: Endpoints::default(),
@@ -384,12 +468,23 @@ mod tests {
         })
     }
 
+    /// Insert a live token into the token store for testing.
+    fn insert_token(state: &SharedState, token: &str, username: &str) {
+        let expires_at =
+            std::time::Instant::now() + std::time::Duration::from_secs(TOKEN_TTL_SECS);
+        state
+            .token_store
+            .lock()
+            .unwrap()
+            .insert(token.to_string(), TokenEntry { username: username.to_string(), expires_at });
+    }
+
     #[test]
     fn auth_accepts_valid_bearer() {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        insert_token(&state, "mytoken123", "u");
         headers.insert(header::AUTHORIZATION, "Bearer mytoken123".parse().unwrap());
         assert!(check_auth(&headers, &state).is_some());
     }
@@ -399,7 +494,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        insert_token(&state, "mytoken123", "u");
         headers.insert(header::AUTHORIZATION, "Bearer wrongtoken".parse().unwrap());
         assert!(check_auth(&headers, &state).is_none());
     }
@@ -409,7 +504,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        insert_token(&state, "mytoken123", "u");
         // Basic auth should no longer be accepted
         headers.insert(header::AUTHORIZATION, "Basic dTpw".parse().unwrap());
         assert!(check_auth(&headers, &state).is_none());
@@ -420,9 +515,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("cookietoken".to_string());
+        insert_token(&state, "cookietoken", "u");
         headers.insert(header::COOKIE, "ttyd_session=cookietoken".parse().unwrap());
         assert!(check_auth(&headers, &state).is_some());
+    }
+
+    #[test]
+    fn auth_rejects_expired_token() {
+        let mut headers = HeaderMap::new();
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
+        // Insert already-expired token
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        state.token_store.lock().unwrap().insert(
+            "expiredtoken".to_string(),
+            TokenEntry { username: "u".to_string(), expires_at: past },
+        );
+        headers.insert(header::AUTHORIZATION, "Bearer expiredtoken".parse().unwrap());
+        assert!(check_auth(&headers, &state).is_none());
     }
 
     #[test]
@@ -439,7 +549,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("tok".to_string());
+        insert_token(&state, "tok", "u");
         headers.insert(header::AUTHORIZATION, "Bearer tok".parse().unwrap());
         let resp = handle_request("/token".to_string(), headers, state, None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -452,6 +562,7 @@ mod tests {
             ws: "/base/ws".to_string(),
             index: "/base/".to_string(),
             login: "/base/login".to_string(),
+            logout: "/base/logout".to_string(),
             parent: "/base".to_string(),
         };
         let resp = handle_request("/base".to_string(), HeaderMap::new(), state, None).await;
@@ -463,7 +574,6 @@ mod tests {
     async fn unauthenticated_request_shows_login_page() {
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        Arc::get_mut(&mut state).unwrap().session_token = Some("tok".to_string());
         let resp = handle_request("/".to_string(), HeaderMap::new(), state, None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();

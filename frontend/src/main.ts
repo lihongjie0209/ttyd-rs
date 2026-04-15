@@ -388,6 +388,8 @@ function renderTreeRows(parentPathKey: string, depth: number, rows: HTMLLIElemen
     }
     for (const item of children) {
         const li = document.createElement('li');
+        li.dataset.path = item.path;
+        li.dataset.isDir = item.is_dir ? '1' : '0';
         const expanded = item.is_dir && expandedDirs.has(item.path);
 
         const inner = document.createElement('div');
@@ -605,6 +607,82 @@ renameBtn.onclick = () => { void renameSelected(); };
 deleteBtn.onclick = () => { void deleteSelected(); };
 uploadBtn.onclick = () => { void uploadSelected(); };
 downloadBtn.onclick = () => { void downloadSelected(); };
+
+// Logout button
+const logoutBtn = document.getElementById('logout-btn') as HTMLButtonElement | null;
+if (logoutBtn) {
+    logoutBtn.addEventListener('click', async () => {
+        try {
+            await fetch('/logout', { method: 'POST', credentials: 'include' });
+        } catch (_) { /* ignore network errors */ }
+        window.location.href = '/login';
+    });
+}
+
+// ── drag & drop upload ────────────────────────────────────────────────────────
+
+async function uploadFilesTo(dir: string, files: FileList | File[]) {
+    const arr = Array.from(files);
+    if (arr.length === 0) return;
+    try {
+        for (const file of arr) {
+            const content = new Uint8Array(await file.arrayBuffer());
+            await wsRpc('file.upload', {
+                path: dir,
+                name: file.name,
+                content_base64: bytesToBase64(content),
+                overwrite: true,
+            });
+        }
+        await refreshTree();
+    } catch (e) {
+        await uiAlert(String(e), '上传失败');
+    }
+}
+
+/** Return the directory path for a drop target element (li or the tree root). */
+function dropTargetDir(target: EventTarget | null): string {
+    const li = (target as HTMLElement | null)?.closest('li[data-path]') as HTMLLIElement | null;
+    if (!li) return '';
+    const path = li.dataset.path ?? '';
+    const isDir = li.dataset.isDir === '1';
+    return isDir ? path : parentPath(path);
+}
+
+fileTree.addEventListener('dragenter', (ev) => {
+    ev.preventDefault();
+    const li = (ev.target as HTMLElement).closest('li[data-path]') as HTMLLIElement | null;
+    if (li) {
+        li.classList.add('drag-over');
+    } else {
+        fileTree.classList.add('drag-over-root');
+    }
+});
+
+fileTree.addEventListener('dragover', (ev) => {
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+});
+
+fileTree.addEventListener('dragleave', (ev) => {
+    const li = (ev.target as HTMLElement).closest('li[data-path]') as HTMLLIElement | null;
+    if (li) {
+        li.classList.remove('drag-over');
+    } else {
+        fileTree.classList.remove('drag-over-root');
+    }
+});
+
+fileTree.addEventListener('drop', (ev) => {
+    ev.preventDefault();
+    // Clear all highlights
+    fileTree.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    fileTree.classList.remove('drag-over-root');
+    const files = ev.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    const dir = dropTargetDir(ev.target);
+    void uploadFilesTo(dir, files);
+});
 
 fileContextMenu.addEventListener('click', (ev) => {
     const target = ev.target as HTMLElement;
