@@ -1,4 +1,5 @@
 mod assets;
+mod audit;
 mod file_api;
 mod http;
 mod noise;
@@ -11,10 +12,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, State, WebSocketUpgrade},
-    http::{HeaderMap, Uri},
+    extract::{ConnectInfo, Json, State, WebSocketUpgrade},
+    http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use clap::Parser;
@@ -25,6 +26,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use audit::AuditLogger;
 use server::{Endpoints, ServerState, SharedState};
 
 #[derive(Parser, Debug)]
@@ -137,8 +139,8 @@ struct Cli {
     #[arg(short = 'a', long = "url-arg", help = "Allow URL arguments (?arg=foo)")]
     url_arg: bool,
 
-    #[arg(short = 'W', long, help = "Allow clients to write to the TTY")]
-    writable: bool,
+    #[arg(short = 'R', long = "readonly", help = "Make the terminal read-only (disable input)")]
+    readonly: bool,
 
     #[arg(
         short = 'T',
@@ -186,11 +188,14 @@ struct Cli {
     #[arg(short = 'B', long, help = "Open browser on start")]
     browser: bool,
 
+    #[arg(long = "audit-log", help = "Write detailed audit logs (JSONL) to file")]
+    audit_log: Option<String>,
+
     #[arg(
-        long = "ws-noise",
-        help = "Enable Noise encryption for WebSocket payloads"
+        long = "disable-ws-noise",
+        help = "Disable Noise encryption for WebSocket payloads"
     )]
-    ws_noise: bool,
+    disable_ws_noise: bool,
 
     #[arg(short = 'd', long, default_value = "7", help = "Log level 0-7")]
     debug: u8,
@@ -259,10 +264,18 @@ fn build_state(
     credential_raw: Option<String>,
     ip_whitelist: Vec<IpNet>,
     lrzsz_supported: bool,
+    audit_logger: Option<Arc<AuditLogger>>,
 ) -> SharedState {
     let credential = credential_raw.as_ref().map(|c| {
         use base64::{engine::general_purpose::STANDARD, Engine};
         STANDARD.encode(c.as_bytes())
+    });
+    let session_token = credential.as_ref().map(|_| {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rand_core::RngCore;
+        let mut bytes = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut bytes);
+        URL_SAFE_NO_PAD.encode(bytes)
     });
 
     let mut prefs: Map<String, Value> = Map::new();
@@ -282,7 +295,7 @@ fn build_state(
         Endpoints {
             ws: format!("{}/ws", b),
             index: format!("{}/", b),
-            token: format!("{}/token", b),
+            login: format!("{}/login", b),
             parent: b.to_string(),
         }
     } else {
@@ -301,7 +314,7 @@ fn build_state(
         sig_code: cli.signal,
         sig_name: sig_name(cli.signal),
         url_arg: cli.url_arg,
-        writable: cli.writable,
+        writable: !cli.readonly,
         check_origin: cli.check_origin,
         max_clients: cli.max_clients,
         once: cli.once,
@@ -310,7 +323,9 @@ fn build_state(
         ping_interval: cli.ping_interval,
         srv_buf_size: cli.srv_buf_size.max(128),
         lrzsz_supported,
-        ws_noise: cli.ws_noise,
+        ws_noise: !cli.disable_ws_noise,
+        session_token,
+        audit_logger,
         ip_whitelist,
         endpoints,
         bound_port: std::sync::atomic::AtomicI32::new(0),
@@ -343,6 +358,29 @@ async fn route_ws(
         uri,
         client_ip,
     )
+}
+
+async fn route_login_get(
+    State(state): State<SharedState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+) -> impl IntoResponse {
+    let client_ip = peer.map(|p| p.0.ip());
+    if !state.is_ip_allowed(client_ip) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    http::login_page(State(state)).await
+}
+
+async fn route_login_post(
+    State(state): State<SharedState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    Json(payload): Json<http::LoginRequest>,
+) -> impl IntoResponse {
+    let client_ip = peer.map(|p| p.0.ip());
+    if !state.is_ip_allowed(client_ip) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    http::login_submit(State(state), Json(payload)).await
 }
 
 fn make_addr(cli: &Cli) -> anyhow::Result<SocketAddr> {
@@ -439,7 +477,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let state = build_state(&cli, credential_raw, ip_whitelist, lrzsz_supported);
+    let audit_logger = if let Some(path) = &cli.audit_log {
+        Some(Arc::new(AuditLogger::open(std::path::Path::new(path))?))
+    } else {
+        None
+    };
+
+    let state = build_state(
+        &cli,
+        credential_raw,
+        ip_whitelist,
+        lrzsz_supported,
+        audit_logger,
+    );
     info!(
         "ttyd-rs {} | command: {} | signal: {} ({})",
         env!("CARGO_PKG_VERSION"),
@@ -448,26 +498,17 @@ async fn main() -> anyhow::Result<()> {
         state.sig_code
     );
     if !state.writable {
-        warn!("readonly mode (--writable not set)");
+        warn!("readonly mode (--readonly flag set)");
     }
     if state.lrzsz_supported {
         info!("lrzsz support detected (rz/sz available)");
     }
 
     let ws_path = state.endpoints.ws.clone();
-    let api_prefix = state.endpoints.parent.clone();
-    let api_list_path = format!("{}/api/files/list", api_prefix);
-    let api_mkdir_path = format!("{}/api/files/mkdir", api_prefix);
-    let api_new_file_path = format!("{}/api/files/new-file", api_prefix);
-    let api_rename_path = format!("{}/api/files/rename", api_prefix);
-    let api_delete_path = format!("{}/api/files/delete", api_prefix);
+    let login_path = state.endpoints.login.clone();
     let app = Router::new()
         .route(&ws_path, get(route_ws))
-        .route(&api_list_path, get(file_api::list_files))
-        .route(&api_mkdir_path, post(file_api::mkdir))
-        .route(&api_new_file_path, post(file_api::new_file))
-        .route(&api_rename_path, post(file_api::rename))
-        .route(&api_delete_path, post(file_api::delete))
+        .route(&login_path, get(route_login_get).post(route_login_post))
         .fallback(route_http)
         .with_state(state.clone());
 

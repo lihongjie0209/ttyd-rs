@@ -1,65 +1,345 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ttyd - Terminal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        html, body { width: 100%; height: 100%; background: #1e1e1e; overflow: hidden; }
-        #app { width: 100%; height: 100%; display: flex; }
+        .hidden { display: none !important; }
+        html, body {
+            width: 100%; height: 100%;
+            background:
+                radial-gradient(1200px 600px at 10% -20%, rgba(68, 139, 255, 0.18), transparent 60%),
+                radial-gradient(900px 500px at 100% 120%, rgba(95, 225, 169, 0.12), transparent 60%),
+                #0f1115;
+            overflow: hidden;
+            font-family: "Manrope", "Segoe UI", sans-serif;
+        }
+        #app { width: 100%; height: 100%; display: flex; padding: 10px; gap: 10px; }
         #file-pane {
-            width: 280px; min-width: 220px; max-width: 40%;
-            border-right: 1px solid #333; background: #171717; color: #ddd;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            width: 286px; min-width: 220px; max-width: 36%;
+            border: 1px solid #273444;
+            background: linear-gradient(180deg, rgba(18, 24, 33, 0.96), rgba(16, 21, 30, 0.96));
+            border-radius: 12px;
+            color: #d9e4ef;
             display: flex; flex-direction: column;
+            overflow: hidden;
+            box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
         }
         #file-toolbar {
-            display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-bottom: 1px solid #2b2b2b;
+            display: flex; align-items: center; gap: 5px; padding: 6px 8px; border-bottom: 1px solid #1e2d3d;
+            background: rgba(10, 14, 20, 0.35);
         }
-        #file-toolbar button {
-            border: 1px solid #3b3b3b; background: #222; color: #ddd;
-            border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px;
+        .toolbar-main {
+            display: flex;
+            flex-wrap: nowrap;
+            gap: 4px;
+            flex: 1;
+            min-width: 0;
         }
-        #file-toolbar button:hover { background: #2f2f2f; }
-        #file-tree { list-style: none; padding: 8px; margin: 0; overflow: auto; flex: 1; font-size: 13px; }
-        #file-tree li { padding: 3px 6px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        #file-tree li:hover { background: #262626; }
-        #file-tree li.selected { background: #004e8c; color: #fff; }
-        #terminal-pane { flex: 1; min-width: 0; height: 100%; }
-        #terminal { width: 100%; height: 100%; padding: 4px; }
+        #file-toolbar button,
+        #file-toolbar button[type="button"],
+        #file-toolbar button:not([role="switch"]) {
+            all: unset;
+            box-sizing: border-box;
+            cursor: pointer;
+            border-radius: 6px;
+            background: #1f2a38;
+            border: 1px solid #31465e;
+            color: #c8ddef;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 11px;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+            flex: 0 0 auto;
+            height: 26px;
+            padding: 0 9px;
+            line-height: 26px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: background 0.12s, border-color 0.12s;
+        }
+        #file-toolbar button:hover { background: #2b3a4f !important; border-color: #43617f !important; }
+        #file-more-menu {
+            position: relative;
+            margin-left: auto;
+        }
+        #file-more-btn {
+            background: #1f2a38 !important;
+            border-color: #31465e !important;
+        }
+        #file-more-btn.active { background: #2b3a4f !important; border-color: #43617f !important; }
+        #file-more-list {
+            position: absolute;
+            right: 0;
+            top: calc(100% + 4px);
+            min-width: 120px;
+            padding: 4px;
+            border: 1px solid #38506b;
+            border-radius: 8px;
+            background: #17212e;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+            z-index: 40;
+            display: grid;
+            gap: 2px;
+        }
+        #file-more-list.hidden { display: none; }
+        #file-more-list button {
+            width: 100% !important;
+            text-align: left !important;
+            justify-content: flex-start !important;
+        }
+        @media (max-width: 1200px) {
+            #file-pane { width: 260px; min-width: 200px; max-width: 34%; }
+        }
+        #file-pane-header {
+            display: flex;
+            align-items: center;
+            padding: 8px 10px 6px;
+            border-bottom: 1px solid #1e2d3d;
+            gap: 6px;
+        }
+        #file-pane-header-icon {
+            color: #5b9bd5;
+            flex-shrink: 0;
+        }
+        #file-pane-title {
+            font-size: 11px;
+            font-family: "JetBrains Mono", monospace;
+            color: #6b8aa8;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+        #file-tree {
+            list-style: none;
+            padding: 4px 0;
+            margin: 0;
+            overflow: auto;
+            flex: 1;
+            font-size: 12.5px;
+            font-family: "JetBrains Mono", monospace;
+        }
+        #file-tree::-webkit-scrollbar { width: 4px; }
+        #file-tree::-webkit-scrollbar-track { background: transparent; }
+        #file-tree::-webkit-scrollbar-thumb { background: #2a3d52; border-radius: 4px; }
+        #file-tree li {
+            display: flex;
+            align-items: center;
+            height: 26px;
+            padding: 0 8px;
+            cursor: pointer;
+            white-space: nowrap;
+            overflow: hidden;
+            position: relative;
+            color: #b8cfe3;
+            transition: background 0.1s, color 0.1s;
+            user-select: none;
+        }
+        #file-tree li:hover { background: rgba(42, 65, 90, 0.55); color: #ddeeff; }
+        #file-tree li.selected {
+            background: rgba(47, 102, 167, 0.28);
+            color: #e8f3ff;
+        }
+        #file-tree li.selected::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 2px; bottom: 2px;
+            width: 2.5px;
+            background: #4a90d9;
+            border-radius: 0 2px 2px 0;
+        }
+        .tree-row-inner {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            min-width: 0;
+            overflow: hidden;
+        }
+        .tree-icon {
+            flex-shrink: 0;
+            width: 15px;
+            height: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .tree-icon svg {
+            width: 13px;
+            height: 13px;
+        }
+        .tree-indent {
+            display: flex;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .tree-toggle {
+            width: 14px;
+            height: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+            flex-shrink: 0;
+            color: #5b7a94;
+            transition: transform 0.15s;
+        }
+        .tree-toggle:hover { color: #8ab4cf; }
+        .tree-toggle.expanded { transform: rotate(90deg); }
+        .tree-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+            min-width: 0;
+        }
+        #file-tree .empty-tree {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 120px;
+            color: #3d5468;
+            font-size: 11px;
+            gap: 6px;
+            pointer-events: none;
+        }
+        #file-tree li:hover { background: rgba(42, 65, 90, 0.55); color: #ddeeff; }
+        #file-context-menu {
+            position: fixed; z-index: 120;
+            display: none; min-width: 140px;
+            background: #17212e; border: 1px solid #38506b; border-radius: 8px;
+            padding: 4px;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+        }
+        #file-context-menu button {
+            width: 100%;
+            border: none; background: transparent; color: #d8e5f3;
+            text-align: left; padding: 6px 8px; border-radius: 5px; cursor: pointer; font-size: 12px;
+            font-family: "JetBrains Mono", monospace;
+        }
+        #file-context-menu button:hover { background: #2a3a4d; }
+        #terminal-pane {
+            flex: 1; min-width: 0; height: 100%;
+            border: 1px solid #263446;
+            border-radius: 12px;
+            background: rgba(10, 12, 16, 0.88);
+            overflow: hidden;
+            box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
+        }
+        #terminal { width: 100%; height: 100%; padding: 10px; }
         .xterm { height: 100%; }
         #overlay {
             position: fixed; inset: 0;
             display: flex; align-items: center; justify-content: center;
-            background: rgba(0,0,0,0.7);
-            color: #fff; font-family: monospace; font-size: 14px;
+            background: rgba(5, 7, 10, 0.72);
+            color: #fff; font-size: 14px;
             z-index: 100;
         }
         #overlay.hidden { display: none; }
         #overlay-box {
-            background: #2b2b2b; border: 1px solid #444;
-            padding: 24px 32px; border-radius: 6px; text-align: center;
+            background: #182130;
+            border: 1px solid #32455d;
+            padding: 24px 32px;
+            border-radius: 10px;
+            text-align: center;
+            min-width: 280px;
         }
-        #overlay-box h2 { margin-bottom: 12px; font-size: 16px; }
-        #overlay-box p { color: #aaa; font-size: 13px; }
+        #overlay-box h2 { margin-bottom: 12px; font-size: 17px; }
+        #overlay-box p { color: #b9c8d6; font-size: 13px; }
         #reconnect-btn {
             margin-top: 16px; padding: 8px 20px;
-            background: #0078d4; color: #fff; border: none;
-            border-radius: 4px; cursor: pointer; font-size: 13px;
+            background: #2f66a7; color: #fff; border: none;
+            border-radius: 7px; cursor: pointer; font-size: 13px;
         }
-        #reconnect-btn:hover { background: #005fa3; }
+        #reconnect-btn:hover { background: #3c79c3; }
+        #ui-modal {
+            position: fixed; inset: 0; z-index: 160;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(7, 10, 14, 0.68);
+        }
+        #ui-modal.hidden { display: none; }
+        #ui-modal-card {
+            width: min(420px, calc(100vw - 32px));
+            background: #182130;
+            border: 1px solid #35506c;
+            border-radius: 12px;
+            padding: 14px;
+            box-shadow: 0 16px 34px rgba(0,0,0,0.48);
+        }
+        #ui-modal-title {
+            margin: 0 0 8px;
+            font-size: 14px;
+            font-family: "JetBrains Mono", monospace;
+            color: #e9f2fb;
+        }
+        #ui-modal-message {
+            margin: 0;
+            color: #c7d8ea;
+            font-size: 13px;
+        }
+        #ui-modal-input {
+            margin-top: 10px;
+            width: 100%;
+            border-radius: 8px;
+            border: 1px solid #3f5c79;
+            background: #121a26;
+            color: #e7f1fb;
+            padding: 8px 10px;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 13px;
+        }
+        #ui-modal-actions {
+            margin-top: 12px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+        }
+        #ui-modal-actions button {
+            --pico-font-size: 0.76rem;
+            --pico-form-element-spacing-vertical: 0.42rem;
+            --pico-form-element-spacing-horizontal: 0.75rem;
+            margin: 0;
+            border-radius: 7px;
+            font-family: "JetBrains Mono", monospace;
+        }
     </style>
 </head>
 <body>
     <div id="app">
         <aside id="file-pane">
+            <div id="file-pane-header">
+                <span id="file-pane-header-icon">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h3.378a1.5 1.5 0 0 1 1.06.44l.622.622A1.5 1.5 0 0 0 9.62 3.5H12.5A1.5 1.5 0 0 1 14 5v7.5A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5Z" fill="#4a7ab5"/></svg>
+                </span>
+                <span id="file-pane-title">文件浏览器</span>
+            </div>
             <div id="file-toolbar">
-                <button id="file-refresh-btn">刷新</button>
-                <button id="file-new-file-btn">新建文件</button>
-                <button id="file-new-dir-btn">新建文件夹</button>
-                <button id="file-rename-btn">重命名</button>
-                <button id="file-delete-btn">删除</button>
+                <div class="toolbar-main">
+                    <button id="file-refresh-btn" title="刷新">
+                        <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M13.65 2.35A8 8 0 1 0 15 8h-1.5a6.5 6.5 0 1 1-1.13-3.72L10.5 6.5H15V2l-1.35.35Z" fill="currentColor"/></svg>
+                        刷新
+                    </button>
+                    <button id="file-upload-btn" title="上传文件">
+                        <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M8 1 4 5h3v6h2V5h3L8 1Zm-5 11v2h10v-2H3Z" fill="currentColor"/></svg>
+                        上传
+                    </button>
+                </div>
+                <div id="file-more-menu">
+                    <button id="file-more-btn">更多 ▾</button>
+                    <div id="file-more-list" class="hidden">
+                        <button id="file-new-file-btn">新建文件</button>
+                        <button id="file-new-dir-btn">新建目录</button>
+                        <button id="file-download-btn">下载</button>
+                        <button id="file-rename-btn">重命名</button>
+                        <button id="file-delete-btn">删除</button>
+                    </div>
+                </div>
             </div>
             <ul id="file-tree"></ul>
         </aside>
@@ -72,6 +352,26 @@
             <h2 id="overlay-title">Connecting…</h2>
             <p id="overlay-msg">Please wait</p>
             <button id="reconnect-btn" style="display:none" onclick="location.reload()">Reconnect</button>
+        </div>
+    </div>
+    <div id="file-context-menu">
+        <button data-action="refresh">刷新</button>
+        <button data-action="upload">上传到此处</button>
+        <button data-action="download">下载</button>
+        <button data-action="new-file">新建文件</button>
+        <button data-action="new-dir">新建文件夹</button>
+        <button data-action="rename">重命名</button>
+        <button data-action="delete">删除</button>
+    </div>
+    <div id="ui-modal" class="hidden">
+        <div id="ui-modal-card">
+            <h3 id="ui-modal-title">提示</h3>
+            <p id="ui-modal-message"></p>
+            <input id="ui-modal-input" type="text" class="hidden" />
+            <div id="ui-modal-actions">
+                <button id="ui-modal-cancel-btn" class="secondary">取消</button>
+                <button id="ui-modal-ok-btn">确认</button>
+            </div>
         </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

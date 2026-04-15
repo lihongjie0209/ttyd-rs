@@ -1,74 +1,99 @@
 # ttyd-rs
 
-Rust 版本的 ttyd 独立复刻，实现 Web 终端共享、认证、IP 白名单、lrzsz、文件树操作，并将前端打包进单二进制。
+A Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd) — share your terminal over the web as a single self-contained binary. Features a dark-themed UI with a file browser sidebar, WS Noise encryption, Basic Auth, and lrzsz file transfer.
 
-## 主要功能
+## Screenshots
 
-- PTY over WebSocket（xterm.js 前端）
-- Basic Auth / 代理认证头
-- IP 白名单（CIDR）
-- lrzsz（rz/sz）文件传输与首次登录提示
-- 左侧文件树与常见文件操作（list/mkdir/new-file/rename/delete）
-- `--base-path` 反向代理路径支持
-- 可选 WS 噪声加密：`--ws-noise`（Noise_NN_25519_ChaChaPoly_SHA256）
+| Login | Terminal |
+|-------|----------|
+| ![Login](docs/images/login.png) | ![Terminal](docs/images/terminal.png) |
 
-## 本地运行
+| File Browser | Context Menu |
+|-------------|--------------|
+| ![File Browser](docs/images/file-tree.png) | ![Context Menu](docs/images/context-menu.png) |
+
+## Features
+
+- **PTY over WebSocket** — full xterm.js terminal in the browser
+- **Auth-gated login page** — login page served when `--credential` is set; main terminal hidden until authenticated
+- **File browser sidebar** — list, expand, upload, download (directories as `.zip`), rename, delete, new file/dir, right-click context menu
+- **WS Noise encryption** — Noise_NN_25519_ChaChaPoly_SHA256 enabled by default (`--disable-ws-noise` to turn off)
+- **Basic Auth** (`-c user:pass` / `--username` + `--password`) and proxy auth header (`--auth-header`)
+- **IP allowlist** — CIDR-based (`--allow-ip`)
+- **lrzsz** — `rz`/`sz` file transfer with first-login hint
+- **Audit log** — JSONL structured log of every connection, command, and file operation (`--audit-log <path>`)
+- **`--base-path`** — reverse-proxy sub-path support
+- **Read-only mode** — `--readonly` disables terminal input
+- **Single binary** — frontend assets are gzip-embedded at build time via `build.rs`
+
+## Quick Start
 
 ```bash
-cargo run -- --port 7681 --username admin --password admin --writable -- cmd
+# Linux / macOS
+cargo run -- -c admin:admin --port 7681 bash
+
+# Windows
+cargo run -- -c admin:admin --port 7681 cmd
 ```
 
-Linux/macOS:
+Open `http://localhost:7681`, sign in with `admin / admin`.
+
+### Common options
 
 ```bash
-cargo run -- --port 7681 --username admin --password admin --writable -- bash
+# Disable WS Noise (plain WebSocket)
+cargo run -- --disable-ws-noise -c admin:admin --port 7681 bash
+
+# Enable audit log
+cargo run -- --audit-log ./audit.log -c admin:admin --port 7681 bash
+
+# Read-only terminal (no keyboard input forwarded)
+cargo run -- --readonly -c admin:admin --port 7681 bash
+
+# Set file browser root to a specific directory
+cargo run -- --cwd /srv/data -c admin:admin --port 7681 bash
 ```
 
-启用 WS Noise：
+## Build
 
-```bash
-cargo run -- --ws-noise --port 7681 --username admin --password admin --writable -- bash
-```
-
-## 构建说明
-
-- `build.rs` 会自动执行前端安装与构建（`frontend`）
-- 构建产物会 gzip 并嵌入 Rust 二进制
+`build.rs` automatically runs `npm install && npm run build` inside `frontend/` and embeds the output:
 
 ```bash
 cargo build --release
+# Output: target/release/ttyd  (or ttyd.exe on Windows)
 ```
 
-输出：
+## Docker
 
-- Windows: `target/release/ttyd.exe`
-- Linux/macOS: `target/release/ttyd`
+```bash
+docker build -t ttyd-rs:latest .
 
-## Python 集成测试
+# No auth
+docker run --rm -p 7681:7681 ttyd-rs:latest bash
+
+# With auth via TTYD_ARGS
+docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" ttyd-rs:latest bash
+```
+
+The `docker-entrypoint.sh` reads `TTYD_ARGS` and prepends them to the command, so you can configure the server entirely via environment variables.
+
+## Integration Tests
 
 ```bash
 python scripts/integration_test.py
 ```
 
-覆盖认证、白名单、文件 API CRUD、路径穿越负向用例、WS 回归与 base-path。
+Covers: auth, IP allowlist, file API CRUD, path-traversal rejection, WS regression, base-path.
 
-## Docker 运行
+## CI / Releases
 
-```bash
-docker build -t ttyd-rs:latest .
-docker run --rm -p 7681:7681 ttyd-rs:latest
-```
+GitHub Actions workflow: `.github/workflows/release.yml`
 
-## CI 发布（Linux / macOS）
+- Triggers on `v*` tag push or manual dispatch
+- Builds on `ubuntu-latest` and `macos-latest`
+- Artifacts: `ttyd-${platform}.tar.gz` uploaded to GitHub Release
 
-已提供 GitHub Actions 工作流：`.github/workflows/release.yml`
+## Security Notes
 
-- 触发条件：`v*` tag push 或手动触发
-- 构建平台：`ubuntu-latest`、`macos-latest`
-- 产物：`ttyd-${platform}.tar.gz`
-- 自动上传到 GitHub Release
-
-## 安全建议
-
-- 生产环境建议启用 HTTPS/TLS，并配合 `--ws-noise`。
-- Noise NN 不提供服务端身份认证，TLS 仍然是必须的身份保障层。
+- **WS Noise (Noise_NN)** encrypts payloads but does **not** authenticate the server. Use HTTPS/TLS in front of ttyd-rs in production.
+- Set a strong `--credential` and restrict access with `--allow-ip` or a reverse proxy.

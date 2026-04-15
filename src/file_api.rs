@@ -1,16 +1,25 @@
+#![allow(dead_code)]
+
 use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use zip::write::FileOptions;
 
-use crate::{http::check_auth, server::SharedState};
+use crate::{audit::AuditEvent, http::check_auth, server::SharedState};
+
+const MAX_RPC_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub struct ApiResponse<T>
@@ -94,26 +103,79 @@ fn current_ip(client: Option<ConnectInfo<SocketAddr>>) -> Option<IpAddr> {
     client.map(|c| c.ip())
 }
 
+fn ip_text(ip: Option<IpAddr>) -> Option<String> {
+    ip.map(|x| x.to_string())
+}
+
+fn actor_text(actor: &str) -> String {
+    if actor.is_empty() {
+        "anonymous".to_string()
+    } else {
+        actor.to_string()
+    }
+}
+
+fn audit_log(
+    state: &SharedState,
+    actor: &str,
+    ip: Option<IpAddr>,
+    action: &str,
+    target: Option<String>,
+    success: bool,
+    message: Option<String>,
+) {
+    if let Some(logger) = &state.audit_logger {
+        logger.log(AuditEvent::new(
+            actor_text(actor),
+            ip_text(ip),
+            action,
+            None,
+            target,
+            success,
+            message,
+        ));
+    }
+}
+
 fn ensure_allowed(
     state: &SharedState,
     headers: &HeaderMap,
     client: Option<ConnectInfo<SocketAddr>>,
-) -> Result<(), (StatusCode, Json<ApiResponse<()>>)> {
-    if let Some(ip) = current_ip(client) {
-        if !state.is_ip_allowed(Some(ip)) {
+) -> Result<(String, Option<IpAddr>), (StatusCode, Json<ApiResponse<()>>)> {
+    let ip = current_ip(client);
+    if let Some(addr) = ip {
+        if !state.is_ip_allowed(Some(addr)) {
+            audit_log(
+                state,
+                "anonymous",
+                ip,
+                "file_api_auth",
+                None,
+                false,
+                Some("forbidden: ip not in whitelist".to_string()),
+            );
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(ApiResponse::err("forbidden: ip not in whitelist")),
             ));
         }
     }
-    if check_auth(headers, state).is_none() {
+    let Some(actor) = check_auth(headers, state) else {
+        audit_log(
+            state,
+            "anonymous",
+            ip,
+            "file_api_auth",
+            None,
+            false,
+            Some("authentication required".to_string()),
+        );
         return Err((
             unauthorized_status(state),
             Json(ApiResponse::err("authentication required")),
         ));
-    }
-    Ok(())
+    };
+    Ok((actor, ip))
 }
 
 fn root_dir(state: &SharedState) -> Result<PathBuf, String> {
@@ -184,6 +246,80 @@ fn canonicalize_in_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn download_name(rel: &str, is_dir: bool) -> String {
+    let base = rel.rsplit('/').next().unwrap_or("").trim();
+    let safe = if base.is_empty() { "download" } else { base };
+    if is_dir {
+        format!("{safe}.zip")
+    } else {
+        safe.to_string()
+    }
+}
+
+fn make_temp_zip_path() -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("ttyd-rs-download-{}-{millis}.zip", std::process::id()))
+}
+
+fn zip_dir_recursive(
+    writer: &mut zip::ZipWriter<std::fs::File>,
+    root_dir: &Path,
+    current_dir: &Path,
+) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(current_dir)
+        .map_err(|e| format!("read directory failed: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read directory entry failed: {e}"))?;
+    entries.sort_by_key(|e| e.file_name().to_string_lossy().to_string());
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("read metadata failed: {e}"))?
+            .file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root_dir)
+            .map_err(|e| format!("resolve relative path failed: {e}"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if file_type.is_dir() {
+            writer
+                .add_directory(format!("{rel}/"), options)
+                .map_err(|e| format!("zip add directory failed: {e}"))?;
+            zip_dir_recursive(writer, root_dir, &path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            let bytes = std::fs::read(&path).map_err(|e| format!("read file failed: {e}"))?;
+            writer
+                .start_file(rel, options)
+                .map_err(|e| format!("zip add file failed: {e}"))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| format!("zip write file failed: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn create_temp_zip_from_dir(dir: &Path) -> Result<PathBuf, String> {
+    let zip_path = make_temp_zip_path();
+    let file = std::fs::File::create(&zip_path).map_err(|e| format!("create zip failed: {e}"))?;
+    let mut writer = zip::ZipWriter::new(file);
+    zip_dir_recursive(&mut writer, dir, dir)?;
+    writer
+        .finish()
+        .map_err(|e| format!("finalize zip failed: {e}"))?;
+    Ok(zip_path)
+}
+
 async fn list_entries(root: &Path, rel_path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = resolve_target(root, rel_path)?;
     let meta = fs::metadata(&dir_path)
@@ -224,13 +360,340 @@ async fn list_entries(root: &Path, rel_path: &str) -> Result<Vec<FileEntry>, Str
     Ok(entries)
 }
 
+pub async fn handle_ws_rpc(
+    state: &SharedState,
+    actor: &str,
+    ip: Option<IpAddr>,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match method {
+        "file.list" => {
+            let root = canonical_root_dir(state)?;
+            let rel = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let rel_norm = normalize_rel_path(&rel)?;
+            let rel_s = rel_to_string(&rel_norm);
+            let entries = list_entries(&root, &rel_s).await?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_list",
+                Some(rel_s),
+                true,
+                Some(format!("entries={}", entries.len())),
+            );
+            Ok(serde_json::json!({ "entries": entries }))
+        }
+        "file.mkdir" => {
+            let root = canonical_root_dir(state)?;
+            let parent_rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            let name = sanitize_name(
+                params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            let parent_target = resolve_target(&root, &parent_rel)?;
+            let parent_canonical = canonicalize_in_root(&root, &parent_target)?;
+            let parent_meta = std::fs::metadata(&parent_canonical)
+                .map_err(|e| format!("stat parent failed: {e}"))?;
+            if !parent_meta.is_dir() {
+                return Err("parent is not a directory".to_string());
+            }
+            let target_rel = join_rel(&parent_rel, &name);
+            let target = parent_canonical.join(&name);
+            let _ = resolve_target(&root, &target_rel)?;
+            fs::create_dir(&target)
+                .await
+                .map_err(|e| format!("mkdir failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_mkdir",
+                Some(target_rel.clone()),
+                true,
+                None,
+            );
+            Ok(serde_json::json!({ "path": target_rel }))
+        }
+        "file.new-file" => {
+            let root = canonical_root_dir(state)?;
+            let parent_rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            let name = sanitize_name(
+                params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            let parent_target = resolve_target(&root, &parent_rel)?;
+            let parent_canonical = canonicalize_in_root(&root, &parent_target)?;
+            let parent_meta = std::fs::metadata(&parent_canonical)
+                .map_err(|e| format!("stat parent failed: {e}"))?;
+            if !parent_meta.is_dir() {
+                return Err("parent is not a directory".to_string());
+            }
+            let target_rel = join_rel(&parent_rel, &name);
+            let target = parent_canonical.join(&name);
+            let _ = resolve_target(&root, &target_rel)?;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(target)
+                .await
+                .map_err(|e| format!("create file failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_new",
+                Some(target_rel.clone()),
+                true,
+                None,
+            );
+            Ok(serde_json::json!({ "path": target_rel }))
+        }
+        "file.rename" => {
+            let root = canonical_root_dir(state)?;
+            let src_rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if src_rel.is_empty() {
+                return Err("cannot rename root".to_string());
+            }
+            let new_name = sanitize_name(
+                params
+                    .get("new_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            let parent_rel = src_rel
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            let dst_rel = join_rel(&parent_rel, &new_name);
+            let src = resolve_target(&root, &src_rel)?;
+            let src_canonical = canonicalize_in_root(&root, &src)?;
+            let dst_parent_target = resolve_target(&root, &parent_rel)?;
+            let dst_parent_canonical = canonicalize_in_root(&root, &dst_parent_target)?;
+            let dst = dst_parent_canonical.join(&new_name);
+            let _ = resolve_target(&root, &dst_rel)?;
+            fs::rename(src_canonical, dst)
+                .await
+                .map_err(|e| format!("rename failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_rename",
+                Some(src_rel),
+                true,
+                Some(format!("new_path={dst_rel}")),
+            );
+            Ok(serde_json::json!({ "path": dst_rel }))
+        }
+        "file.delete" => {
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("cannot delete root".to_string());
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat target failed: {e}"))?;
+            if meta.is_dir() {
+                fs::remove_dir_all(&target)
+                    .await
+                    .map_err(|e| format!("delete directory failed: {e}"))?;
+            } else {
+                fs::remove_file(&target)
+                    .await
+                    .map_err(|e| format!("delete file failed: {e}"))?;
+            }
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_delete",
+                Some(rel.clone()),
+                true,
+                None,
+            );
+            Ok(serde_json::json!({ "path": rel }))
+        }
+        "file.upload" => {
+            let root = canonical_root_dir(state)?;
+            let parent_rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            let name = sanitize_name(
+                params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?;
+            let content_b64 = params
+                .get("content_base64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "content_base64 is required".to_string())?;
+            let overwrite = params
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let bytes = STANDARD
+                .decode(content_b64)
+                .map_err(|e| format!("decode file content failed: {e}"))?;
+            if bytes.len() > MAX_RPC_FILE_BYTES {
+                return Err(format!(
+                    "file too large, max {} bytes",
+                    MAX_RPC_FILE_BYTES
+                ));
+            }
+            let parent_target = resolve_target(&root, &parent_rel)?;
+            let parent_canonical = canonicalize_in_root(&root, &parent_target)?;
+            let parent_meta = std::fs::metadata(&parent_canonical)
+                .map_err(|e| format!("stat parent failed: {e}"))?;
+            if !parent_meta.is_dir() {
+                return Err("parent is not a directory".to_string());
+            }
+            let target_rel = join_rel(&parent_rel, &name);
+            let target = parent_canonical.join(&name);
+            let _ = resolve_target(&root, &target_rel)?;
+            let mut open_opts = fs::OpenOptions::new();
+            open_opts.write(true);
+            if overwrite {
+                open_opts.create(true).truncate(true);
+            } else {
+                open_opts.create_new(true);
+            }
+            let mut file = open_opts
+                .open(&target)
+                .await
+                .map_err(|e| format!("open upload target failed: {e}"))?;
+            file.write_all(&bytes)
+                .await
+                .map_err(|e| format!("write upload target failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_upload",
+                Some(target_rel.clone()),
+                true,
+                Some(format!("size={}", bytes.len())),
+            );
+            Ok(serde_json::json!({ "path": target_rel, "size": bytes.len() }))
+        }
+        "file.download" => {
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("path is required".to_string());
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat target failed: {e}"))?;
+            let is_dir = meta.is_dir();
+            let name = download_name(&rel, is_dir);
+            let bytes = if is_dir {
+                let target_for_zip = target.clone();
+                let zip_path = tokio::task::spawn_blocking(move || create_temp_zip_from_dir(&target_for_zip))
+                    .await
+                    .map_err(|e| format!("zip task failed: {e}"))??;
+                let zip_meta = fs::metadata(&zip_path)
+                    .await
+                    .map_err(|e| format!("stat zip failed: {e}"))?;
+                if zip_meta.len() > MAX_RPC_FILE_BYTES as u64 {
+                    let _ = fs::remove_file(&zip_path).await;
+                    return Err(format!(
+                        "archive too large, max {} bytes",
+                        MAX_RPC_FILE_BYTES
+                    ));
+                }
+                let bytes = fs::read(&zip_path)
+                    .await
+                    .map_err(|e| format!("read zip failed: {e}"))?;
+                let _ = fs::remove_file(&zip_path).await;
+                bytes
+            } else {
+                if meta.len() > MAX_RPC_FILE_BYTES as u64 {
+                    return Err(format!(
+                        "file too large, max {} bytes",
+                        MAX_RPC_FILE_BYTES
+                    ));
+                }
+                fs::read(&target)
+                    .await
+                    .map_err(|e| format!("read file failed: {e}"))?
+            };
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_download",
+                Some(rel.clone()),
+                true,
+                Some(format!("size={}, dir={}", bytes.len(), is_dir)),
+            );
+            Ok(serde_json::json!({
+                "path": rel,
+                "name": name,
+                "size": bytes.len(),
+                "is_dir": is_dir,
+                "content_base64": STANDARD.encode(bytes),
+            }))
+        }
+        "health.live" => Ok(serde_json::json!({ "status": "ok" })),
+        "health.ready" => {
+            let clients = *state.client_count.lock().await;
+            Ok(serde_json::json!({ "status": "ready", "clients": clients }))
+        }
+        _ => Err("unknown rpc method".to_string()),
+    }
+}
+
 pub async fn list_files(
     State(state): State<SharedState>,
     headers: HeaderMap,
     client: Option<ConnectInfo<SocketAddr>>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ApiResponse<ListResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    ensure_allowed(&state, &headers, client)?;
+    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
     let root = canonical_root_dir(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
     let rel = q.path.unwrap_or_default();
@@ -240,6 +703,15 @@ pub async fn list_files(
     let entries = list_entries(&root, &rel_s)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
+    audit_log(
+        &state,
+        &actor,
+        ip,
+        "file_list",
+        Some(rel_s),
+        true,
+        Some(format!("entries={}", entries.len())),
+    );
     Ok(Json(ApiResponse::ok(ListResult { entries })))
 }
 
@@ -249,7 +721,7 @@ pub async fn mkdir(
     client: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    ensure_allowed(&state, &headers, client)?;
+    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
     let root = canonical_root_dir(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
     let parent_rel = rel_to_string(
@@ -284,6 +756,15 @@ pub async fn mkdir(
             Json(ApiResponse::err(format!("mkdir failed: {e}"))),
         )
     })?;
+    audit_log(
+        &state,
+        &actor,
+        ip,
+        "file_mkdir",
+        Some(target_rel.clone()),
+        true,
+        None,
+    );
     Ok(Json(ApiResponse::ok(
         serde_json::json!({ "path": target_rel }),
     )))
@@ -295,7 +776,7 @@ pub async fn new_file(
     client: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<CreateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    ensure_allowed(&state, &headers, client)?;
+    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
     let root = canonical_root_dir(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
     let parent_rel = rel_to_string(
@@ -335,6 +816,15 @@ pub async fn new_file(
                 Json(ApiResponse::err(format!("create file failed: {e}"))),
             )
         })?;
+    audit_log(
+        &state,
+        &actor,
+        ip,
+        "file_new",
+        Some(target_rel.clone()),
+        true,
+        None,
+    );
     Ok(Json(ApiResponse::ok(
         serde_json::json!({ "path": target_rel }),
     )))
@@ -346,7 +836,7 @@ pub async fn rename(
     client: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    ensure_allowed(&state, &headers, client)?;
+    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
     let root = canonical_root_dir(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
     let src_rel = rel_to_string(
@@ -383,6 +873,15 @@ pub async fn rename(
             Json(ApiResponse::err(format!("rename failed: {e}"))),
         )
     })?;
+    audit_log(
+        &state,
+        &actor,
+        ip,
+        "file_rename",
+        Some(src_rel),
+        true,
+        Some(format!("new_path={dst_rel}")),
+    );
     Ok(Json(ApiResponse::ok(
         serde_json::json!({ "path": dst_rel }),
     )))
@@ -394,7 +893,7 @@ pub async fn delete(
     client: Option<ConnectInfo<SocketAddr>>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    ensure_allowed(&state, &headers, client)?;
+    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
     let root = canonical_root_dir(&state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
     let rel = rel_to_string(
@@ -432,5 +931,14 @@ pub async fn delete(
             )
         })?;
     }
+    audit_log(
+        &state,
+        &actor,
+        ip,
+        "file_delete",
+        Some(rel.clone()),
+        true,
+        None,
+    );
     Ok(Json(ApiResponse::ok(serde_json::json!({ "path": rel }))))
 }

@@ -3,24 +3,14 @@ import asyncio
 import base64
 import json
 import sys
-import urllib.request
-
 import websockets
 
 
 SRV_OUTPUT = ord("0")
 SRV_SET_TITLE = ord("1")
 SRV_SET_PREFS = ord("2")
+SRV_RPC = ord("4")
 CMD_INPUT = b"0"
-
-
-def fetch_token(base_url: str, auth_header: str | None) -> str:
-    req = urllib.request.Request(f"{base_url}/token")
-    if auth_header:
-        req.add_header("Authorization", auth_header)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-        return payload.get("token", "")
 
 
 async def read_message(ws, timeout: float = 10.0):
@@ -47,7 +37,6 @@ async def wait_for_output_contains(ws, needle: str, timeout: float = 10.0) -> st
 
 async def run(base_url: str, auth_header: str | None):
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
-    token = fetch_token(base_url, auth_header)
 
     headers = {}
     if auth_header:
@@ -63,11 +52,19 @@ async def run(base_url: str, auth_header: str | None):
         if SRV_SET_TITLE not in kinds or SRV_SET_PREFS not in kinds:
             raise AssertionError(f"missing initial frames, got: {sorted(kinds)}")
 
-        await ws.send(json.dumps({"AuthToken": token, "columns": 120, "rows": 30}))
+        await ws.send(json.dumps({"columns": 120, "rows": 30}))
         await ws.send('1{"columns":100,"rows":28}')
         await ws.send("2")
         await asyncio.sleep(0.05)
         await ws.send("3")
+
+        await ws.send('4{"id":1,"method":"health.live","params":{}}')
+        rpc = await read_message(ws)
+        if not rpc or rpc[0] != SRV_RPC:
+            raise AssertionError("missing rpc response")
+        rpc_json = json.loads(rpc[1:].decode("utf-8"))
+        if not rpc_json.get("ok"):
+            raise AssertionError(f"health rpc failed: {rpc_json}")
 
         await ws.send(CMD_INPUT + b"echo __WS_REGRESSION_OK__\r")
         output = await wait_for_output_contains(ws, "__WS_REGRESSION_OK__", timeout=12)

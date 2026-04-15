@@ -7,11 +7,13 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::net::IpAddr;
 use std::time::Duration;
-use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
+use urlencoding::decode;
 
+use crate::audit::AuditEvent;
+use crate::file_api;
 use crate::http::check_auth;
 use crate::noise::{
     responder_handshake, NoiseReceiver, NoiseSender, NOISE_CLIENT_HELLO, NOISE_DATA,
@@ -25,15 +27,49 @@ const CMD_INPUT: u8 = b'0';
 const CMD_RESIZE: u8 = b'1';
 const CMD_PAUSE: u8 = b'2';
 const CMD_RESUME: u8 = b'3';
+const CMD_RPC: u8 = b'4';
 const CMD_JSON_DATA: u8 = b'{';
 
 const SRV_OUTPUT: u8 = b'0';
 const SRV_SET_TITLE: u8 = b'1';
 const SRV_SET_PREFS: u8 = b'2';
-const MAX_WS_FRAME_SIZE: usize = 1024 * 1024;
+const SRV_RPC: u8 = b'4';
+const MAX_WS_FRAME_SIZE: usize = 24 * 1024 * 1024;
 const MAX_WS_INPUT_SIZE: usize = 64 * 1024;
 const MAX_WS_JSON_SIZE: usize = 8 * 1024;
+const MAX_WS_RPC_SIZE: usize = 16 * 1024 * 1024;
 const MAX_WS_FRAMES_PER_SEC: u32 = 500;
+
+fn actor_text(actor: &str) -> String {
+    if actor.is_empty() {
+        "anonymous".to_string()
+    } else {
+        actor.to_string()
+    }
+}
+
+fn audit_log(
+    state: &SharedState,
+    actor: &str,
+    ip: Option<IpAddr>,
+    action: &str,
+    command: Option<String>,
+    target: Option<String>,
+    success: bool,
+    message: Option<String>,
+) {
+    if let Some(logger) = &state.audit_logger {
+        logger.log(AuditEvent::new(
+            actor_text(actor),
+            ip.map(|x| x.to_string()),
+            action,
+            command,
+            target,
+            success,
+            message,
+        ));
+    }
+}
 
 fn to_bytes(msg: Message) -> Option<Vec<u8>> {
     match msg {
@@ -115,7 +151,7 @@ fn extract_url_args(query: Option<&str>, enabled: bool) -> Vec<String> {
             let k = it.next()?;
             let v = it.next()?;
             if k == "arg" {
-                Some(v.to_string())
+                decode(v).ok().map(|s| s.into_owned())
             } else {
                 None
             }
@@ -131,6 +167,16 @@ pub fn handle_upgrade(
     client_ip: Option<IpAddr>,
 ) -> impl IntoResponse {
     if !state.is_ip_allowed(client_ip) {
+        audit_log(
+            &state,
+            "anonymous",
+            client_ip,
+            "ws_connect",
+            None,
+            None,
+            false,
+            Some("ip not in whitelist".to_string()),
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -138,6 +184,16 @@ pub fn handle_upgrade(
     let auth_user = if let Some(user) = check_auth(&headers, &state) {
         user
     } else {
+        audit_log(
+            &state,
+            "anonymous",
+            client_ip,
+            "ws_connect",
+            None,
+            None,
+            false,
+            Some("authentication failed".to_string()),
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -155,6 +211,16 @@ pub fn handle_upgrade(
             let origin_host = extract_host_from_origin(origin);
             if normalize_host_port(origin_host) != normalize_host_port(host) {
                 warn!("refusing WS from different origin: {}", origin);
+                audit_log(
+                    &state,
+                    &auth_user,
+                    client_ip,
+                    "ws_connect",
+                    None,
+                    None,
+                    false,
+                    Some("origin check failed".to_string()),
+                );
                 return StatusCode::FORBIDDEN.into_response();
             }
         }
@@ -163,7 +229,7 @@ pub fn handle_upgrade(
     // URL args (?arg=foo&arg=bar)
     let url_args = extract_url_args(uri.query(), state.url_arg);
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, url_args, auth_user))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, url_args, auth_user, client_ip))
 }
 
 async fn handle_socket(
@@ -171,6 +237,7 @@ async fn handle_socket(
     state: SharedState,
     url_args: Vec<String>,
     auth_user: String,
+    client_ip: Option<IpAddr>,
 ) {
     // Check once / max_clients
     {
@@ -187,6 +254,16 @@ async fn handle_socket(
         *state.client_count.lock().await += 1;
         info!("WS connected, clients: {}", count + 1);
     }
+    audit_log(
+        &state,
+        &auth_user,
+        client_ip,
+        "ws_connect",
+        None,
+        None,
+        true,
+        None,
+    );
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -195,6 +272,16 @@ async fn handle_socket(
             Ok(ctx) => ctx,
             Err(e) => {
                 warn!("noise handshake failed: {}", e);
+                audit_log(
+                    &state,
+                    &auth_user,
+                    client_ip,
+                    "noise_handshake",
+                    None,
+                    None,
+                    false,
+                    Some(e),
+                );
                 cleanup(&state).await;
                 return;
             }
@@ -202,6 +289,18 @@ async fn handle_socket(
     } else {
         (None, None)
     };
+    if state.ws_noise {
+        audit_log(
+            &state,
+            &auth_user,
+            client_ip,
+            "noise_handshake",
+            None,
+            None,
+            true,
+            None,
+        );
+    }
 
     // Send SET_WINDOW_TITLE
     let hostname = hostname::get()
@@ -248,9 +347,12 @@ async fn handle_socket(
 
     // Channel: PTY events -> WS output task
     let (pty_event_tx, mut pty_event_rx) = mpsc::channel::<PtyEvent>(256);
+    let (ws_reply_tx, mut ws_reply_rx) = mpsc::channel::<Vec<u8>>(256);
 
     // Spawn output forwarding task
     let state_for_output = state.clone();
+    let actor_for_output = auth_user.clone();
+    let ip_for_output = client_ip;
     let mut noise_tx_for_output = noise_tx;
     let output_task = tokio::spawn(async move {
         let mut ping = tokio::time::interval(std::time::Duration::from_secs(
@@ -279,6 +381,16 @@ async fn handle_socket(
                             }
                         }
                         PtyEvent::Exit(code) => {
+                            audit_log(
+                                &state_for_output,
+                                &actor_for_output,
+                                ip_for_output,
+                                "pty_exit",
+                                None,
+                                Some(state_for_output.command.clone()),
+                                code == 0,
+                                Some(format!("exit_code={code}")),
+                            );
                             let close_code = if code == 0 { 1000u16 } else { 1006 };
                             let _ = ws_tx
                                 .send(Message::Close(Some(CloseFrame {
@@ -290,6 +402,16 @@ async fn handle_socket(
                         }
                     }
                 }
+                maybe_reply = ws_reply_rx.recv() => {
+                    let Some(reply) = maybe_reply else { break };
+                    let wire = match encode_ws_binary(reply, &mut noise_tx_for_output) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    if ws_tx.send(Message::Binary(wire.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         cleanup(&state_for_output).await;
@@ -297,8 +419,8 @@ async fn handle_socket(
 
     // Receive loop
     let mut pty_handle: Option<crate::pty::PtyHandle> = None;
-    let mut authenticated = state.credential.is_none();
     let mut lrzsz_notice_sent = false;
+    let mut input_line_buf = String::new();
     let mut frame_count: u32 = 0;
     let mut frame_window_start = Instant::now();
 
@@ -357,15 +479,41 @@ async fn handle_socket(
             warn!("ws json payload too large");
             break;
         }
-
-        if state.credential.is_some() && !authenticated && cmd != CMD_JSON_DATA {
-            warn!("WS client not authenticated");
+        if cmd == CMD_RPC && data.len() > (1 + MAX_WS_RPC_SIZE) {
+            warn!("ws rpc payload too large");
             break;
         }
 
         match cmd {
+            NOISE_CLIENT_HELLO if !state.ws_noise => {
+                // Allow frontend noise-probe frames when Noise is disabled.
+                continue;
+            }
             CMD_INPUT => {
                 if state.writable {
+                    if state.audit_logger.is_some() {
+                        let text = String::from_utf8_lossy(&data[1..]);
+                        for ch in text.chars() {
+                            if ch == '\r' || ch == '\n' {
+                                let cmd = input_line_buf.trim().to_string();
+                                if !cmd.is_empty() {
+                                    audit_log(
+                                        &state,
+                                        &auth_user,
+                                        client_ip,
+                                        "terminal_command",
+                                        Some(cmd),
+                                        Some(state.command.clone()),
+                                        true,
+                                        Some("accepted".to_string()),
+                                    );
+                                }
+                                input_line_buf.clear();
+                            } else if !ch.is_control() && input_line_buf.len() < 4096 {
+                                input_line_buf.push(ch);
+                            }
+                        }
+                    }
                     if let Some(h) = &pty_handle {
                         let _ = h.cmd_tx.send(PtyCommand::Input(data[1..].to_vec())).await;
                     }
@@ -391,19 +539,30 @@ async fn handle_socket(
                     let _ = h.cmd_tx.send(PtyCommand::Resume).await;
                 }
             }
+            CMD_RPC => {
+                let json = std::str::from_utf8(&data[1..]).unwrap_or("{}");
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+                    let req_id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("");
+                    let params = v
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let result =
+                        file_api::handle_ws_rpc(&state, &auth_user, client_ip, method, &params)
+                            .await;
+                    let body = match result {
+                        Ok(data) => serde_json::json!({ "id": req_id, "ok": true, "data": data }),
+                        Err(err) => serde_json::json!({ "id": req_id, "ok": false, "error": err }),
+                    };
+                    let mut packet = vec![SRV_RPC];
+                    packet.extend_from_slice(body.to_string().as_bytes());
+                    let _ = ws_reply_tx.send(packet).await;
+                }
+            }
             CMD_JSON_DATA => {
                 let json = std::str::from_utf8(&data).unwrap_or("{}");
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
-                    if let Some(credential) = &state.credential {
-                        let token = v["AuthToken"].as_str().unwrap_or("");
-                        if credential.as_bytes().ct_eq(token.as_bytes()).into() {
-                            authenticated = true;
-                        } else {
-                            warn!("WS auth failed");
-                            break 'recv;
-                        }
-                    }
-
                     if pty_handle.is_none() {
                         let cols = v["columns"].as_u64().unwrap_or(80) as u16;
                         let rows = v["rows"].as_u64().unwrap_or(24) as u16;
@@ -427,6 +586,16 @@ async fn handle_socket(
                         ) {
                             Ok(handle) => {
                                 pty_handle = Some(handle);
+                                audit_log(
+                                    &state,
+                                    &auth_user,
+                                    client_ip,
+                                    "pty_spawn",
+                                    Some(state.command.clone()),
+                                    Some(state.cwd.clone().unwrap_or_else(|| ".".to_string())),
+                                    true,
+                                    None,
+                                );
                                 if state.lrzsz_supported && !lrzsz_notice_sent {
                                     lrzsz_notice_sent = true;
                                     let notice = b"\r\n[ttyd] Server supports lrzsz (rz/sz) file transfer.\r\n";
@@ -436,6 +605,16 @@ async fn handle_socket(
                             }
                             Err(e) => {
                                 warn!("spawn_pty failed: {}", e);
+                                audit_log(
+                                    &state,
+                                    &auth_user,
+                                    client_ip,
+                                    "pty_spawn",
+                                    Some(state.command.clone()),
+                                    Some(state.cwd.clone().unwrap_or_else(|| ".".to_string())),
+                                    false,
+                                    Some(e.to_string()),
+                                );
                                 break 'recv;
                             }
                         }
@@ -444,6 +623,16 @@ async fn handle_socket(
             }
             _ => {
                 warn!("unknown WS cmd: {:?}", cmd as char);
+                audit_log(
+                    &state,
+                    &auth_user,
+                    client_ip,
+                    "ws_protocol",
+                    None,
+                    None,
+                    false,
+                    Some(format!("unknown command byte={cmd}")),
+                );
                 break 'recv;
             }
         }

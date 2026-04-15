@@ -1,4 +1,5 @@
 import { Terminal, ITerminalOptions } from '@xterm/xterm';
+import '@picocss/pico/css/pico.min.css';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { CanvasAddon } from '@xterm/addon-canvas';
@@ -19,17 +20,20 @@ const CMD_INPUT = '0';
 const CMD_RESIZE = '1';
 const CMD_PAUSE = '2';
 const CMD_RESUME = '3';
+const CMD_RPC = '4';
 
 /** Server → Client */
 const SRV_OUTPUT = 0x30; // '0'
 const SRV_SET_TITLE = 0x31; // '1'
 const SRV_SET_PREFS = 0x32; // '2'
+const SRV_RPC = 0x34; // '4'
 
 /** Noise transport */
 const NOISE_CLIENT_HELLO = 0x90;
 const NOISE_SERVER_HELLO = 0x91;
 const NOISE_DATA = 0x92;
 const NOISE_PROTOCOL = 'Noise_NN_25519_ChaChaPoly_SHA256';
+const PLAINTEXT_SERVER_CMDS = new Set<number>([SRV_OUTPUT, SRV_SET_TITLE, SRV_SET_PREFS, SRV_RPC]);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -125,6 +129,12 @@ class NoiseTransport {
     }
 }
 
+class PlaintextWsFallbackError extends Error {
+    constructor(public firstFrame: Uint8Array) {
+        super('server is running without ws noise');
+    }
+}
+
 async function waitForBinaryFrame(ws: WebSocket, timeoutMs = 10000): Promise<Uint8Array> {
     return await new Promise<Uint8Array>((resolve, reject) => {
         const timer = window.setTimeout(() => {
@@ -161,10 +171,14 @@ async function doNoiseHandshake(ws: WebSocket): Promise<NoiseTransport> {
     const hello = new Uint8Array(1 + ePub.length);
     hello[0] = NOISE_CLIENT_HELLO;
     hello.set(ePub, 1);
+    const respPromise = waitForBinaryFrame(ws);
     ws.send(hello);
 
-    const resp = await waitForBinaryFrame(ws);
+    const resp = await respPromise;
     if (resp.length !== 49 || resp[0] !== NOISE_SERVER_HELLO) {
+        if (PLAINTEXT_SERVER_CMDS.has(resp[0])) {
+            throw new PlaintextWsFallbackError(resp);
+        }
         throw new Error('invalid noise server hello');
     }
     const re = resp.slice(1, 33);
@@ -173,7 +187,7 @@ async function doNoiseHandshake(ws: WebSocket): Promise<NoiseTransport> {
     const dh = x25519.getSharedSecret(ePriv, re);
     const mix = noiseMixKey(ck, dh);
     ck = mix.ck;
-    const plain = decryptWithAd(mix.tempKey, 0, h, c);
+    const plain = decryptWithAd(mix.tempKey, 0n, h, c);
     if (plain.length !== 0) {
         throw new Error('invalid noise server payload');
     }
@@ -203,6 +217,24 @@ const newFileBtn = document.getElementById('file-new-file-btn') as HTMLButtonEle
 const newDirBtn = document.getElementById('file-new-dir-btn') as HTMLButtonElement;
 const renameBtn = document.getElementById('file-rename-btn') as HTMLButtonElement;
 const deleteBtn = document.getElementById('file-delete-btn') as HTMLButtonElement;
+const uploadBtn = document.getElementById('file-upload-btn') as HTMLButtonElement;
+const downloadBtn = document.getElementById('file-download-btn') as HTMLButtonElement;
+const fileContextMenu = document.getElementById('file-context-menu') as HTMLDivElement;
+const moreBtn = document.getElementById('file-more-btn') as HTMLButtonElement;
+const moreList = document.getElementById('file-more-list') as HTMLDivElement;
+const uiModal = document.getElementById('ui-modal') as HTMLDivElement;
+const uiModalTitle = document.getElementById('ui-modal-title') as HTMLHeadingElement;
+const uiModalMessage = document.getElementById('ui-modal-message') as HTMLParagraphElement;
+const uiModalInput = document.getElementById('ui-modal-input') as HTMLInputElement;
+const uiModalCancelBtn = document.getElementById('ui-modal-cancel-btn') as HTMLButtonElement;
+const uiModalOkBtn = document.getElementById('ui-modal-ok-btn') as HTMLButtonElement;
+
+moreBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const open = !moreList.classList.contains('hidden');
+    moreList.classList.toggle('hidden', open);
+    moreBtn.classList.toggle('active', !open);
+});
 
 const expandedDirs = new Set<string>(['']);
 const childCache = new Map<string, FileEntry[]>();
@@ -217,29 +249,89 @@ function pathJoin(parent: string, name: string): string {
     return parent ? `${parent}/${name}` : name;
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-    const res = await fetch(buildUrl(path));
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = (await res.json()) as ApiResponse<T>;
-    if (!body.ok) throw new Error(body.error ?? 'request failed');
-    return body.data as T;
+function bytesToBase64(bytes: Uint8Array): string {
+    const chunkSize = 0x8000;
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        bin += String.fromCharCode(...chunk);
+    }
+    return btoa(bin);
 }
 
-async function apiPost<T>(path: string, payload: unknown): Promise<T> {
-    const res = await fetch(buildUrl(path), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+function base64ToBytes(base64: string): Uint8Array {
+    const bin = atob(base64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+type DialogKind = 'alert' | 'confirm' | 'prompt';
+
+function showDialog(kind: DialogKind, title: string, message: string, value = ''): Promise<string | boolean | null> {
+    return new Promise((resolve) => {
+        uiModalTitle.textContent = title;
+        uiModalMessage.textContent = message;
+        uiModal.classList.remove('hidden');
+        uiModalInput.value = value;
+
+        const promptMode = kind === 'prompt';
+        const cancelVisible = kind !== 'alert';
+        uiModalInput.classList.toggle('hidden', !promptMode);
+        uiModalCancelBtn.classList.toggle('hidden', !cancelVisible);
+        uiModalOkBtn.textContent = kind === 'alert' ? '知道了' : '确认';
+
+        const done = (result: string | boolean | null) => {
+            uiModal.classList.add('hidden');
+            uiModalOkBtn.onclick = null;
+            uiModalCancelBtn.onclick = null;
+            uiModal.onclick = null;
+            uiModalInput.onkeydown = null;
+            resolve(result);
+        };
+
+        uiModalOkBtn.onclick = () => {
+            if (kind === 'confirm') done(true);
+            else if (kind === 'prompt') done(uiModalInput.value.trim());
+            else done(true);
+        };
+        uiModalCancelBtn.onclick = () => done(false);
+        uiModal.onclick = (ev) => {
+            if (ev.target === uiModal) done(kind === 'alert' ? true : false);
+        };
+        uiModalInput.onkeydown = (ev) => {
+            if (ev.key === 'Enter') uiModalOkBtn.click();
+            if (ev.key === 'Escape') done(false);
+        };
+
+        if (promptMode) {
+            queueMicrotask(() => {
+                uiModalInput.focus();
+                uiModalInput.select();
+            });
+        } else {
+            queueMicrotask(() => uiModalOkBtn.focus());
+        }
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = (await res.json()) as ApiResponse<T>;
-    if (!body.ok) throw new Error(body.error ?? 'request failed');
-    return body.data as T;
+}
+
+async function uiAlert(message: string, title = '提示') {
+    await showDialog('alert', title, message);
+}
+
+async function uiConfirm(message: string, title = '确认') {
+    return (await showDialog('confirm', title, message)) === true;
+}
+
+async function uiPrompt(title: string, defaultValue = '') {
+    const result = await showDialog('prompt', title, '', defaultValue);
+    if (typeof result !== 'string') return null;
+    const trimmed = result.trim();
+    return trimmed.length > 0 ? trimmed : null;
 }
 
 async function listDir(path = ''): Promise<FileEntry[]> {
-    const qp = encodeURIComponent(path);
-    const data = await apiGet<{ entries: FileEntry[] }>(`/api/files/list?path=${qp}`);
+    const data = await wsRpc<{ entries: FileEntry[] }>('file.list', { path });
     return data.entries;
 }
 
@@ -260,25 +352,98 @@ async function hydrateExpanded(path: string): Promise<void> {
     }
 }
 
+const FILE_ICONS: Record<string, string> = {
+    // Folder icons are handled separately
+    ts: '#4a9eff', tsx: '#4a9eff', js: '#f0db4f', jsx: '#61dafb',
+    rs: '#f74c00', py: '#3572A5', go: '#00add8', java: '#b07219',
+    cpp: '#f34b7d', c: '#555555', h: '#555555', cs: '#178600',
+    html: '#e34c26', css: '#563d7c', scss: '#c6538c', json: '#cbcb41',
+    md: '#083fa1', txt: '#aaa', sh: '#89e051', bash: '#89e051',
+    yaml: '#cb171e', yml: '#cb171e', toml: '#9c4221', xml: '#0060ac',
+    sql: '#e38c00', svg: '#ff9900', png: '#6e4c13', jpg: '#6e4c13',
+    jpeg: '#6e4c13', gif: '#6e4c13', ico: '#6e4c13', webp: '#6e4c13',
+    pdf: '#b30b00', zip: '#8a5a28', gz: '#8a5a28', tar: '#8a5a28',
+};
+
+function getFileIconSvg(name: string, isDir: boolean, expanded: boolean): string {
+    if (isDir) {
+        if (expanded) {
+            return `<svg viewBox="0 0 16 16" fill="none"><path d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.379a1.5 1.5 0 0 1 1.06.44l.622.622A1.5 1.5 0 0 0 9.12 3.5H13A1.5 1.5 0 0 1 14.5 5v1H2V3.5Zm-1 3.25v5.75A1.5 1.5 0 0 0 2 14h12a1.5 1.5 0 0 0 1.5-1.5V6.75Z" fill="#e8a84b"/></svg>`;
+        }
+        return `<svg viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h3.378a1.5 1.5 0 0 1 1.06.44l.622.622A1.5 1.5 0 0 0 9.62 3.5H12.5A1.5 1.5 0 0 1 14 5v7.5A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5Z" fill="#6699cc"/></svg>`;
+    }
+    const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
+    const color = FILE_ICONS[ext] ?? '#7a9ab8';
+    return `<svg viewBox="0 0 16 16" fill="none"><path d="M4 2h6.414L13 4.586V14H3V2h1zm6 0v2.5H12.5" stroke="${color}" stroke-width="1.2"/></svg>`;
+}
+
 function renderTreeRows(parentPathKey: string, depth: number, rows: HTMLLIElement[]) {
     const children = childCache.get(parentPathKey) ?? [];
+    if (children.length === 0 && depth === 0) {
+        const li = document.createElement('li');
+        li.className = 'empty-tree';
+        li.innerHTML = `<svg width="28" height="28" viewBox="0 0 16 16" fill="none"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h3.378a1.5 1.5 0 0 1 1.06.44l.622.622A1.5 1.5 0 0 0 9.62 3.5H12.5A1.5 1.5 0 0 1 14 5v7.5A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5Z" fill="#2a3d52"/></svg><span>暂无文件</span>`;
+        rows.push(li);
+        return;
+    }
     for (const item of children) {
         const li = document.createElement('li');
-        li.style.paddingLeft = `${6 + depth * 16}px`;
         const expanded = item.is_dir && expandedDirs.has(item.path);
-        const marker = item.is_dir ? (expanded ? '📂' : '📁') : '📄';
-        li.textContent = `${marker} ${item.name}`;
+
+        const inner = document.createElement('div');
+        inner.className = 'tree-row-inner';
+
+        // Indent
+        if (depth > 0) {
+            const indent = document.createElement('span');
+            indent.className = 'tree-indent';
+            indent.style.width = `${depth * 16}px`;
+            inner.appendChild(indent);
+        }
+
+        // Toggle arrow for dirs
+        if (item.is_dir) {
+            const toggle = document.createElement('span');
+            toggle.className = 'tree-toggle' + (expanded ? ' expanded' : '');
+            toggle.innerHTML = `<svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`;
+            inner.appendChild(toggle);
+        } else {
+            const spacer = document.createElement('span');
+            spacer.style.width = '14px';
+            spacer.style.flexShrink = '0';
+            inner.appendChild(spacer);
+        }
+
+        // File icon
+        const iconEl = document.createElement('span');
+        iconEl.className = 'tree-icon';
+        iconEl.innerHTML = getFileIconSvg(item.name, item.is_dir, expanded);
+        inner.appendChild(iconEl);
+
+        // Name
+        const nameEl = document.createElement('span');
+        nameEl.className = 'tree-name';
+        nameEl.textContent = item.name;
+        nameEl.title = item.path;
+        inner.appendChild(nameEl);
+
+        li.appendChild(inner);
         if (item.path === selectedPath) li.classList.add('selected');
-        li.onclick = async () => {
+
+        li.onclick = async (ev: MouseEvent) => {
+            ev.stopPropagation();
             selectedPath = item.path;
+            if (item.is_dir) {
+                if (expandedDirs.has(item.path)) expandedDirs.delete(item.path);
+                else { expandedDirs.add(item.path); await ensureChildren(item.path); }
+            }
             await renderFileTree();
         };
-        li.ondblclick = async () => {
-            if (!item.is_dir) return;
-            if (expandedDirs.has(item.path)) expandedDirs.delete(item.path);
-            else expandedDirs.add(item.path);
-            if (expandedDirs.has(item.path)) await ensureChildren(item.path);
+        li.oncontextmenu = async (ev: MouseEvent) => {
+            ev.preventDefault();
+            selectedPath = item.path;
             await renderFileTree();
+            showContextMenu(ev.clientX, ev.clientY);
         };
         rows.push(li);
         if (item.is_dir && expandedDirs.has(item.path)) {
@@ -317,60 +482,162 @@ async function refreshTree() {
     await renderFileTree();
 }
 
-refreshBtn.onclick = () => { void refreshTree(); };
-newFileBtn.onclick = async () => {
-    const name = window.prompt('输入新文件名');
+function hideContextMenu() {
+    fileContextMenu.style.display = 'none';
+}
+
+function showContextMenu(x: number, y: number) {
+    const maxX = window.innerWidth - fileContextMenu.offsetWidth - 8;
+    const maxY = window.innerHeight - fileContextMenu.offsetHeight - 8;
+    fileContextMenu.style.left = `${Math.max(8, Math.min(x, maxX))}px`;
+    fileContextMenu.style.top = `${Math.max(8, Math.min(y, maxY))}px`;
+    fileContextMenu.style.display = 'block';
+}
+
+fileTree.oncontextmenu = (ev: MouseEvent) => {
+    if ((ev.target as HTMLElement).closest('li')) return;
+    ev.preventDefault();
+    selectedPath = '';
+    void renderFileTree().then(() => showContextMenu(ev.clientX, ev.clientY));
+};
+
+document.addEventListener('click', () => { hideContextMenu(); moreList.classList.add('hidden'); moreBtn.classList.remove('active'); });
+window.addEventListener('blur', () => hideContextMenu());
+window.addEventListener('resize', () => hideContextMenu());
+
+async function createNewFile() {
+    const name = await uiPrompt('输入新文件名');
     if (!name) return;
     const dir = defaultCreateDir();
     try {
-        await apiPost('/api/files/new-file', { path: dir, name });
+        await wsRpc('file.new-file', { path: dir, name });
         await refreshTree();
     } catch (e) {
-        window.alert(String(e));
+        await uiAlert(String(e), '创建失败');
     }
-};
-newDirBtn.onclick = async () => {
-    const name = window.prompt('输入新文件夹名');
+}
+
+async function createNewDir() {
+    const name = await uiPrompt('输入新文件夹名');
     if (!name) return;
     const dir = defaultCreateDir();
     try {
-        await apiPost('/api/files/mkdir', { path: dir, name });
+        await wsRpc('file.mkdir', { path: dir, name });
         expandedDirs.add(pathJoin(dir, name));
         await refreshTree();
     } catch (e) {
-        window.alert(String(e));
+        await uiAlert(String(e), '创建失败');
     }
-};
-renameBtn.onclick = async () => {
+}
+
+async function renameSelected() {
     if (!selectedPath) {
-        window.alert('请先选择文件或目录');
+        await uiAlert('请先选择文件或目录');
         return;
     }
     const current = selectedPath.split('/').pop() ?? selectedPath;
-    const newName = window.prompt('输入新名称', current);
+    const newName = await uiPrompt('输入新名称', current);
     if (!newName || newName === current) return;
     try {
-        await apiPost('/api/files/rename', { path: selectedPath, new_name: newName });
+        await wsRpc('file.rename', { path: selectedPath, new_name: newName });
         selectedPath = pathJoin(parentPath(selectedPath), newName);
         await refreshTree();
     } catch (e) {
-        window.alert(String(e));
+        await uiAlert(String(e), '重命名失败');
     }
-};
-deleteBtn.onclick = async () => {
+}
+
+async function deleteSelected() {
     if (!selectedPath) {
-        window.alert('请先选择文件或目录');
+        await uiAlert('请先选择文件或目录');
         return;
     }
-    if (!window.confirm(`确认删除 ${selectedPath} ?`)) return;
+    if (!(await uiConfirm(`确认删除 ${selectedPath} ?`))) return;
     try {
-        await apiPost('/api/files/delete', { path: selectedPath });
+        await wsRpc('file.delete', { path: selectedPath });
         selectedPath = '';
         await refreshTree();
     } catch (e) {
-        window.alert(String(e));
+        await uiAlert(String(e), '删除失败');
     }
-};
+}
+
+async function uploadToDir(dir: string) {
+    try {
+        const files = await chooseFiles();
+        for (const file of Array.from(files)) {
+            const content = new Uint8Array(await file.arrayBuffer());
+            await wsRpc('file.upload', {
+                path: dir,
+                name: file.name,
+                content_base64: bytesToBase64(content),
+                overwrite: true,
+            });
+        }
+        await refreshTree();
+    } catch (e) {
+        await uiAlert(String(e), '上传失败');
+    }
+}
+
+async function uploadSelected() {
+    await uploadToDir(defaultCreateDir());
+}
+
+async function downloadSelected() {
+    if (!selectedPath) {
+        await uiAlert('请先选择要下载的文件或目录');
+        return;
+    }
+    try {
+        const data = await wsRpc<{ name: string; content_base64: string }>('file.download', { path: selectedPath });
+        const bytes = base64ToBytes(data.content_base64);
+        saveBlob(data.name || 'download.bin', [bytes]);
+    } catch (e) {
+        await uiAlert(String(e), '下载失败');
+    }
+}
+
+refreshBtn.onclick = () => { void refreshTree(); };
+newFileBtn.onclick = () => { void createNewFile(); };
+newDirBtn.onclick = () => { void createNewDir(); };
+renameBtn.onclick = () => { void renameSelected(); };
+deleteBtn.onclick = () => { void deleteSelected(); };
+uploadBtn.onclick = () => { void uploadSelected(); };
+downloadBtn.onclick = () => { void downloadSelected(); };
+
+fileContextMenu.addEventListener('click', (ev) => {
+    const target = ev.target as HTMLElement;
+    const btn = target.closest('button[data-action]') as HTMLButtonElement | null;
+    if (!btn) return;
+    const action = btn.dataset.action;
+    hideContextMenu();
+    switch (action) {
+        case 'refresh':
+            void refreshTree();
+            break;
+        case 'upload':
+            void uploadSelected();
+            break;
+        case 'download':
+            void downloadSelected();
+            break;
+        case 'new-file':
+            void createNewFile();
+            break;
+        case 'new-dir':
+            void createNewDir();
+            break;
+        case 'rename':
+            void renameSelected();
+            break;
+        case 'delete':
+            void deleteSelected();
+            break;
+        default:
+            break;
+    }
+});
 
 // ── overlay helpers ──────────────────────────────────────────────────────────
 
@@ -486,6 +753,20 @@ let paused = false;
 let wsNoiseEnabled = false;
 let noiseTransport: NoiseTransport | null = null;
 let noiseHandshakeInProgress = false;
+let wsRpcSeq = 1;
+const wsRpcPending = new Map<number, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
+
+function wsRpc<T>(method: string, params: unknown): Promise<T> {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !initialized) {
+        return Promise.reject(new Error('websocket is not ready'));
+    }
+    const id = wsRpcSeq++;
+    return new Promise<T>((resolve, reject) => {
+        wsRpcPending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+        const body = JSON.stringify({ id, method, params });
+        sendWire(CMD_RPC + body);
+    });
+}
 
 // Flow control: buffer output while paused
 const outputQueue: Uint8Array[] = [];
@@ -624,22 +905,11 @@ function ensureZmodem() {
     });
 }
 
-/** Fetch the auth token from /token */
-async function fetchToken(): Promise<{ token: string; wsNoise: boolean }> {
-    const res = await fetch(buildUrl('/token'));
-    if (!res.ok) throw new Error(`token fetch failed: ${res.status}`);
-    const data = await res.json() as { token?: string; ws_noise?: boolean };
-    return {
-        token: data.token ?? '',
-        wsNoise: !!data.ws_noise,
-    };
-}
-
-/** Send initial JSON handshake with auth token and window size */
-function sendHandshake(token: string) {
+/** Send initial JSON handshake with window size */
+function sendHandshake() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const { cols, rows } = term;
-    const msg = JSON.stringify({ AuthToken: token, columns: cols, rows });
+    const msg = JSON.stringify({ columns: cols, rows });
     sendWire(msg);
 }
 
@@ -702,6 +972,20 @@ function handleMessage(data: ArrayBuffer) {
             applyPrefs(dec.decode(buf.slice(1)));
             break;
         }
+        case SRV_RPC: {
+            try {
+                const payload = JSON.parse(dec.decode(buf.slice(1))) as ApiResponse<unknown> & { id?: number };
+                const id = Number(payload.id ?? 0);
+                const pending = wsRpcPending.get(id);
+                if (!pending) break;
+                wsRpcPending.delete(id);
+                if (payload.ok) pending.resolve(payload.data);
+                else pending.reject(new Error(payload.error ?? 'rpc failed'));
+            } catch {
+                // ignore malformed rpc payload
+            }
+            break;
+        }
         default:
             break;
     }
@@ -745,14 +1029,6 @@ async function connect() {
     noiseTransport = null;
     wsNoiseEnabled = false;
 
-    let tokenInfo: { token: string; wsNoise: boolean } = { token: '', wsNoise: false };
-    try {
-        tokenInfo = await fetchToken();
-    } catch (e) {
-        showOverlay('Connection Failed', String(e), true);
-        return;
-    }
-
     const wsUrl = buildWsUrl();
     ws = new WebSocket(wsUrl, ['tty']);
     ws.binaryType = 'arraybuffer';
@@ -760,24 +1036,42 @@ async function connect() {
     ws.onopen = () => {
         void (async () => {
             try {
-                if (tokenInfo.wsNoise) {
-                    noiseHandshakeInProgress = true;
-                    noiseTransport = await doNoiseHandshake(ws!);
-                    wsNoiseEnabled = true;
-                    noiseHandshakeInProgress = false;
-                }
+                noiseHandshakeInProgress = true;
+                noiseTransport = await doNoiseHandshake(ws!);
+                wsNoiseEnabled = true;
+                noiseHandshakeInProgress = false;
                 hideOverlay();
                 fitAddon.fit();
-                sendHandshake(tokenInfo.token);
+                sendHandshake();
                 initialized = true;
                 lastSentCols = -1;
                 lastSentRows = -1;
                 ensureZmodem();
+                void refreshTree();
                 term.focus();
                 // Send current size after handshake
                 scheduleFitAndResize(0, true);
             } catch (e) {
                 noiseHandshakeInProgress = false;
+                if (e instanceof PlaintextWsFallbackError) {
+                    wsNoiseEnabled = false;
+                    noiseTransport = null;
+                    handleMessage(e.firstFrame.buffer.slice(
+                        e.firstFrame.byteOffset,
+                        e.firstFrame.byteOffset + e.firstFrame.byteLength,
+                    ));
+                    hideOverlay();
+                    sendHandshake();
+                    initialized = true;
+                    lastSentCols = -1;
+                    lastSentRows = -1;
+                    ensureZmodem();
+                    void refreshTree();
+                    term.focus();
+                    scheduleFitAndResize(0, true);
+                    return;
+                }
+                console.error(e);
                 showOverlay('Connection Failed', String(e), true);
                 ws?.close();
             }
@@ -794,6 +1088,7 @@ async function connect() {
                 }
                 handleMessage(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
             } catch (e) {
+                console.error(e);
                 showOverlay('Connection Error', String(e), true);
                 ws?.close();
             }
@@ -802,6 +1097,10 @@ async function connect() {
 
     ws.onclose = (ev: CloseEvent) => {
         initialized = false;
+        for (const [, pending] of wsRpcPending) {
+            pending.reject(new Error('websocket closed'));
+        }
+        wsRpcPending.clear();
         zmodemSentry = null;
         resetZmodemState();
         const clean = ev.code === 1000;
@@ -818,5 +1117,4 @@ async function connect() {
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
-void refreshTree();
 connect();

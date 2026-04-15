@@ -1,3 +1,4 @@
+use crate::audit::AuditLogger;
 use ipnet::IpNet;
 use std::net::IpAddr;
 use std::sync::atomic::AtomicI32;
@@ -9,7 +10,7 @@ use tokio::sync::Mutex;
 pub struct Endpoints {
     pub ws: String,
     pub index: String,
-    pub token: String,
+    pub login: String,
     pub parent: String,
 }
 
@@ -18,7 +19,7 @@ impl Default for Endpoints {
         Self {
             ws: "/ws".to_string(),
             index: "/".to_string(),
-            token: "/token".to_string(),
+            login: "/login".to_string(),
             parent: String::new(),
         }
     }
@@ -68,6 +69,10 @@ pub struct ServerState {
     pub lrzsz_supported: bool,
     /// Whether to protect WS payloads with Noise transport encryption
     pub ws_noise: bool,
+    /// Optional browser session token for login-page auth flow
+    pub session_token: Option<String>,
+    /// Optional JSONL audit log sink
+    pub audit_logger: Option<Arc<AuditLogger>>,
     /// Allowed client IP/CIDR list; empty means allow all
     pub ip_whitelist: Vec<IpNet>,
     /// URL endpoint paths

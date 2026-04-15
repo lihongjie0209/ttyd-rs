@@ -24,7 +24,10 @@ WORKDIR /workspace
 
 COPY --from=builder /app/target/release/ttyd /usr/local/bin/ttyd
 
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
 EXPOSE 7681
 
-ENTRYPOINT ["ttyd"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["bash"]

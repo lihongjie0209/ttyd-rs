@@ -1,14 +1,28 @@
 use axum::{
     body::Body,
+    extract::State,
     http::{header, HeaderMap, StatusCode},
     response::Response,
+    Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::Deserialize;
 use std::net::IpAddr;
+use subtle::ConstantTimeEq;
 use tokio::fs;
 use tracing::info;
 
 use crate::assets;
+use crate::audit::AuditEvent;
 use crate::server::SharedState;
+
+const SESSION_COOKIE_NAME: &str = "ttyd_session";
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
 
 fn accepts_gzip(headers: &HeaderMap) -> bool {
     headers
@@ -16,6 +30,73 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.contains("gzip"))
         .unwrap_or(false)
+}
+
+fn login_page_html(state: &SharedState) -> String {
+    let login_path = &state.endpoints.login;
+    let index_path = &state.endpoints.index;
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ttyd Login</title>
+  <style>
+    body {{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#111; color:#eee; }}
+    .wrap {{ min-height:100vh; display:flex; align-items:center; justify-content:center; }}
+    .card {{ width: 320px; background:#1b1b1b; border:1px solid #333; border-radius:8px; padding:20px; }}
+    h1 {{ margin:0 0 12px; font-size:20px; }}
+    input {{ width:100%; box-sizing:border-box; margin:6px 0; padding:10px; border-radius:6px; border:1px solid #444; background:#0f0f0f; color:#eee; }}
+    button {{ width:100%; margin-top:8px; padding:10px; border-radius:6px; border:1px solid #3b6ad9; background:#2b4db1; color:#fff; cursor:pointer; }}
+    .err {{ color:#ff8b8b; min-height:18px; margin-top:8px; font-size:13px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <form class="card" id="f">
+      <h1>Sign in</h1>
+      <input id="u" type="text" placeholder="Username" autocomplete="username" required>
+      <input id="p" type="password" placeholder="Password" autocomplete="current-password" required>
+      <button type="submit">Login</button>
+      <div class="err" id="e"></div>
+    </form>
+  </div>
+  <script>
+    const f = document.getElementById('f');
+    const e = document.getElementById('e');
+    f.addEventListener('submit', async (ev) => {{
+      ev.preventDefault();
+      e.textContent = '';
+      const username = document.getElementById('u').value;
+      const password = document.getElementById('p').value;
+      const r = await fetch('{login_path}', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ username, password }})
+      }});
+      if (r.ok) {{
+        location.href = '{index_path}';
+      }} else {{
+        e.textContent = 'Login failed';
+      }}
+    }});
+  </script>
+</body>
+</html>"#
+    )
+}
+
+fn parse_cookie_value(cookie_header: &str, key: &str) -> Option<String> {
+    for part in cookie_header.split(';') {
+        let kv = part.trim();
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Returns Some(username) if authenticated, None if rejected.
@@ -38,11 +119,111 @@ pub fn check_auth(headers: &HeaderMap, state: &SharedState) -> Option<String> {
             && auth_value.starts_with("Basic ")
             && &auth_value[6..] == credential
         {
-            return Some(String::new());
+            let username = STANDARD
+                .decode(&auth_value[6..])
+                .ok()
+                .and_then(|raw| String::from_utf8(raw).ok())
+                .and_then(|text| text.split_once(':').map(|(u, _)| u.to_string()))
+                .unwrap_or_default();
+            return Some(username);
+        }
+        if let (Some(cookie_header), Some(session_token)) = (
+            headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
+            state.session_token.as_ref(),
+        ) {
+            if let Some(cookie_val) = parse_cookie_value(cookie_header, SESSION_COOKIE_NAME) {
+                if bool::from(cookie_val.as_bytes().ct_eq(session_token.as_bytes())) {
+                    return Some("session".to_string());
+                }
+            }
         }
         return None;
     }
     Some(String::new())
+}
+
+pub async fn login_page(State(state): State<SharedState>) -> Response {
+    if state.credential.is_none() {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, &state.endpoints.index)
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
+    }
+    let body = login_page_html(&state);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html;charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+pub async fn login_submit(
+    State(state): State<SharedState>,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    let Some(credential) = state.credential.as_ref() else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
+    };
+    let expected = STANDARD.encode(format!("{}:{}", req.username, req.password).as_bytes());
+    if !bool::from(expected.as_bytes().ct_eq(credential.as_bytes())) {
+        if let Some(logger) = &state.audit_logger {
+            logger.log(AuditEvent::new(
+                req.username.clone(),
+                None,
+                "login",
+                None,
+                None,
+                false,
+                Some("invalid credentials".to_string()),
+            ));
+        }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
+    }
+    let Some(session_token) = state.session_token.as_ref() else {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_LENGTH, "0")
+            .body(Body::empty())
+            .unwrap();
+    };
+    let cookie_path = if state.endpoints.parent.is_empty() {
+        "/".to_string()
+    } else {
+        state.endpoints.parent.clone()
+    };
+    let cookie = format!(
+        "{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age=86400",
+        SESSION_COOKIE_NAME, session_token, cookie_path
+    );
+    if let Some(logger) = &state.audit_logger {
+        logger.log(AuditEvent::new(
+            req.username,
+            None,
+            "login",
+            None,
+            None,
+            true,
+            None,
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::SET_COOKIE, cookie)
+        .header(header::CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn unauthorized() -> Response {
@@ -78,34 +259,28 @@ pub async fn handle_request(
     client_ip: Option<IpAddr>,
 ) -> Response {
     info!("HTTP {}", path);
+    let ep = &state.endpoints;
 
     if !state.is_ip_allowed(client_ip) {
         return forbidden();
     }
 
     if check_auth(&headers, &state).is_none() {
+        if state.credential.is_some() && (path == ep.index || path == ep.parent) {
+            let body = login_page_html(&state);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html;charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(header::CONTENT_LENGTH, body.len().to_string())
+                .body(Body::from(body))
+                .unwrap();
+        }
         return if state.auth_header.is_some() {
             proxy_auth_required()
         } else {
             unauthorized()
         };
-    }
-
-    let ep = &state.endpoints;
-
-    if path == ep.token {
-        let cred = state.credential.as_deref().unwrap_or("");
-        let body = format!(
-            r#"{{"token": "{}", "ws_noise": {}}}"#,
-            cred,
-            if state.ws_noise { "true" } else { "false" }
-        );
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json;charset=utf-8")
-            .header(header::CONTENT_LENGTH, body.len().to_string())
-            .body(Body::from(body))
-            .unwrap();
     }
 
     if !ep.parent.is_empty() && path == ep.parent {
@@ -197,6 +372,8 @@ mod tests {
             srv_buf_size: 4096,
             lrzsz_supported: false,
             ws_noise: false,
+            session_token: None,
+            audit_logger: None,
             ip_whitelist: vec![],
             endpoints: Endpoints::default(),
             bound_port: AtomicI32::new(0),
@@ -231,15 +408,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_endpoint_returns_credential() {
+    async fn token_endpoint_not_exposed_over_http() {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some("abc".to_string());
         headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
         let resp = handle_request("/token".to_string(), headers, state, None).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, r#"{"token": "abc", "ws_noise": false}"#);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -248,7 +423,7 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().endpoints = Endpoints {
             ws: "/base/ws".to_string(),
             index: "/base/".to_string(),
-            token: "/base/token".to_string(),
+            login: "/base/login".to_string(),
             parent: "/base".to_string(),
         };
         let resp = handle_request("/base".to_string(), HeaderMap::new(), state, None).await;
@@ -261,8 +436,10 @@ mod tests {
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some("abc".to_string());
         let resp = handle_request("/".to_string(), HeaderMap::new(), state, None).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Sign in"));
     }
 
     #[tokio::test]
