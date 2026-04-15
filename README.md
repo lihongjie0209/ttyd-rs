@@ -98,6 +98,12 @@ ttyd-rs uses WebSocket (with optional Noise encryption) and needs proper proxy h
 
 ### Basic HTTP proxy
 
+Start ttyd-rs (listens on localhost only, with auth):
+
+```bash
+ttyd -p 7681 -c admin:secret bash
+```
+
 ```nginx
 server {
     listen 80;
@@ -125,6 +131,12 @@ server {
 ```
 
 ### HTTPS + WSS (recommended for production)
+
+Start ttyd-rs on localhost only. Noise encryption can be disabled when TLS is provided by nginx:
+
+```bash
+ttyd -p 7681 -c admin:secret --disable-noise bash
+```
 
 ```nginx
 server {
@@ -163,10 +175,10 @@ server {
 
 ### Sub-path proxy (`--base-path`)
 
-Start ttyd-rs with `--base-path /ttyd`:
+Mount ttyd-rs under a sub-path so it coexists with other services on the same domain:
 
 ```bash
-ttyd --base-path /ttyd -c admin:admin bash
+ttyd -p 7681 -c admin:secret --base-path /ttyd bash
 ```
 
 Then proxy only that prefix in nginx:
@@ -198,20 +210,34 @@ server {
 
 ### Proxy auth header
 
-If nginx handles authentication and you want to pass the username to ttyd-rs, start with `--auth-header X-Remote-User`:
+Let nginx handle authentication and forward the authenticated username to ttyd-rs via a trusted header. ttyd-rs skips its own credential check and uses the header value as the username:
+
+```bash
+ttyd -p 7681 --auth-header X-Remote-User bash
+```
 
 ```nginx
 location / {
-    # ... your nginx auth ...
+    # ... your nginx auth (e.g. auth_basic, auth_request) ...
     proxy_set_header X-Remote-User $remote_user;
-    proxy_pass http://127.0.0.1:7681;
-    # ... ws headers ...
+
+    proxy_pass         http://127.0.0.1:7681;
+    proxy_http_version 1.1;
+
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+
+    proxy_read_timeout  3600s;
+    proxy_send_timeout  3600s;
 }
 ```
 
-```bash
-ttyd --auth-header X-Remote-User bash
-```
+> **Note:** When using `--auth-header`, never allow external clients to set that header directly — block it at the nginx boundary.
 
 ## Integration Tests
 
