@@ -234,6 +234,92 @@
             font-family: "JetBrains Mono", monospace;
         }
         #file-context-menu button:hover { background: #2a3a4d; }
+        /* ── Editor Pane ──────────────────────────────── */
+        #editor-pane {
+            flex: 0 0 45%;
+            min-width: 280px;
+            height: 100%;
+            border: 1px solid #263446;
+            border-radius: 12px;
+            background: rgba(10, 12, 16, 0.95);
+            overflow: hidden;
+            box-shadow: 0 10px 36px rgba(0, 0, 0, 0.35);
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+        #editor-pane.hidden { display: none !important; }
+        #editor-toolbar {
+            display: flex;
+            align-items: center;
+            padding: 5px 10px;
+            gap: 6px;
+            border-bottom: 1px solid #1e2d3d;
+            background: rgba(10, 14, 20, 0.4);
+            flex-shrink: 0;
+            min-width: 0;
+        }
+        #editor-filename {
+            font-family: "JetBrains Mono", monospace;
+            font-size: 12px;
+            color: #d8e5f3;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+        }
+        #editor-dirty-dot {
+            color: #f0b72f;
+            font-size: 16px;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        #editor-dirty-dot.hidden { display: none; }
+        #editor-lang-badge {
+            font-size: 10px;
+            color: #5b9bd5;
+            background: rgba(91,155,213,0.13);
+            border: 1px solid rgba(91,155,213,0.28);
+            padding: 1px 7px;
+            border-radius: 3px;
+            font-family: "JetBrains Mono", monospace;
+            flex-shrink: 0;
+            text-transform: lowercase;
+        }
+        #editor-save-btn, #editor-close-btn {
+            all: unset;
+            box-sizing: border-box;
+            cursor: pointer;
+            border-radius: 5px;
+            height: 24px;
+            padding: 0 8px;
+            font-size: 11px;
+            font-family: "JetBrains Mono", monospace;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            transition: background 0.12s;
+        }
+        #editor-save-btn {
+            background: #1d4e8f;
+            border: 1px solid #2a6ac4;
+            color: #c8ddef;
+        }
+        #editor-save-btn:hover { background: #2459a8; }
+        #editor-close-btn {
+            background: #1f2a38;
+            border: 1px solid #31465e;
+            color: #8aa4be;
+        }
+        #editor-close-btn:hover { background: #2b3a4f; color: #c8ddef; }
+        #editor-container {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
         #terminal-pane {
             flex: 1; min-width: 0; height: 100%;
             border: 1px solid #263446;
@@ -360,6 +446,19 @@
         <div id="terminal-pane">
             <div id="terminal"></div>
         </div>
+        <div id="editor-pane" class="hidden">
+            <div id="editor-toolbar">
+                <span id="editor-filename">untitled</span>
+                <span id="editor-dirty-dot" class="hidden">●</span>
+                <span id="editor-lang-badge">text</span>
+                <button id="editor-save-btn" title="保存 (Ctrl+S)">
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none"><path d="M3 2h8.586L14 4.414V14H2V2h1zM5 2v4h6V2M4.5 10h7v4h-7z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+                    保存
+                </button>
+                <button id="editor-close-btn" title="关闭编辑器">✕</button>
+            </div>
+            <div id="editor-container"></div>
+        </div>
     </div>
     <div id="overlay">
         <div id="overlay-box">
@@ -374,6 +473,7 @@
         <button data-action="download">下载</button>
         <button data-action="new-file">新建文件</button>
         <button data-action="new-dir">新建文件夹</button>
+        <button data-action="edit">编辑</button>
         <button data-action="rename">重命名</button>
         <button data-action="delete">删除</button>
     </div>

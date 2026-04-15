@@ -678,6 +678,95 @@ pub async fn handle_ws_rpc(
                 "content_base64": STANDARD.encode(bytes),
             }))
         }
+        "file.read" => {
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("path is required".to_string());
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat failed: {e}"))?;
+            if meta.is_dir() {
+                return Err("cannot read a directory".to_string());
+            }
+            if meta.len() > MAX_RPC_FILE_BYTES as u64 {
+                return Err(format!(
+                    "file too large for editing, max {} bytes",
+                    MAX_RPC_FILE_BYTES
+                ));
+            }
+            let bytes = fs::read(&target)
+                .await
+                .map_err(|e| format!("read file failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_read",
+                Some(rel.clone()),
+                true,
+                Some(format!("size={}", bytes.len())),
+            );
+            Ok(serde_json::json!({
+                "path": rel,
+                "size": bytes.len(),
+                "content_base64": STANDARD.encode(&bytes),
+            }))
+        }
+        "file.write" => {
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("path is required".to_string());
+            }
+            let content_b64 = params
+                .get("content_base64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "content_base64 is required".to_string())?;
+            let bytes = STANDARD
+                .decode(content_b64)
+                .map_err(|e| format!("decode content failed: {e}"))?;
+            if bytes.len() > MAX_RPC_FILE_BYTES {
+                return Err(format!(
+                    "content too large, max {} bytes",
+                    MAX_RPC_FILE_BYTES
+                ));
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat failed: {e}"))?;
+            if meta.is_dir() {
+                return Err("cannot write to a directory".to_string());
+            }
+            fs::write(&target, &bytes)
+                .await
+                .map_err(|e| format!("write file failed: {e}"))?;
+            audit_log(
+                state,
+                actor,
+                ip,
+                "file_write",
+                Some(rel.clone()),
+                true,
+                Some(format!("size={}", bytes.len())),
+            );
+            Ok(serde_json::json!({ "path": rel, "size": bytes.len() }))
+        }
         "health.live" => Ok(serde_json::json!({ "status": "ok" })),
         "health.ready" => {
             let clients = *state.client_count.lock().await;

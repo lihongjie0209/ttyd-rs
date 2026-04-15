@@ -7,6 +7,8 @@ export default defineConfig({
         outDir: 'dist',
         target: 'es2020',
         minify: 'esbuild',
+        // Inline all assets (including Monaco's codicon font) as data URLs
+        assetsInlineLimit: 1024 * 1024 * 10,
         rollupOptions: {
             input: 'index.html',
         },

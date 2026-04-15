@@ -1,6 +1,21 @@
+<div align="center">
+
 # ttyd-rs
 
-A Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd) — share your terminal over the web as a single self-contained binary. Features a dark-themed UI with a file browser sidebar, WS Noise encryption, Basic Auth, and lrzsz file transfer.
+**Share your terminal over the web — a Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd)**
+
+[![Build](https://img.shields.io/github/actions/workflow/status/lihongjie0209/ttyd-rs/release.yml?style=flat-square)](https://github.com/lihongjie0209/ttyd-rs/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen?style=flat-square)](#platform-support)
+
+A single self-contained binary that exposes any shell in your browser via WebSocket. Dark-themed xterm.js UI, built-in file browser, end-to-end Noise encryption, and audit logging — zero runtime dependencies.
+
+[Quick Start](#quick-start) · [Features](#features) · [Windows](#windows) · [Docker](#docker) · [Nginx](#nginx-reverse-proxy) · [Security](#security-notes)
+
+</div>
+
+---
 
 ## Screenshots
 
@@ -12,19 +27,26 @@ A Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd) — share your termina
 |-------------|--------------|
 | ![File Browser](docs/images/file-tree.png) | ![Context Menu](docs/images/context-menu.png) |
 
+---
+
 ## Features
 
-- **PTY over WebSocket** — full xterm.js terminal in the browser
-- **Auth-gated login page** — login page served when `--credential` is set; main terminal hidden until authenticated
-- **File browser sidebar** — list, expand, upload, download (directories as `.zip`), rename, delete, new file/dir, right-click context menu
-- **WS Noise encryption** — Noise_NN_25519_ChaChaPoly_SHA256 enabled by default (`--disable-ws-noise` to turn off)
-- **Basic Auth** (`-c user:pass` / `--username` + `--password`) and proxy auth header (`--auth-header`)
-- **IP allowlist** — CIDR-based (`--allow-ip`)
-- **lrzsz** — `rz`/`sz` file transfer with first-login hint
-- **Audit log** — JSONL structured log of every connection, command, and file operation (`--audit-log <path>`)
-- **`--base-path`** — reverse-proxy sub-path support
-- **Read-only mode** — `--readonly` disables terminal input
-- **Single binary** — frontend assets are gzip-embedded at build time via `build.rs`
+| Feature | Description |
+|---------|-------------|
+| **PTY over WebSocket** | Full xterm.js terminal rendered in any browser |
+| **Cross-platform** | Runs on Linux, macOS, and **Windows** (cmd / PowerShell / WSL) |
+| **Auth-gated login** | Login page shown when `--credential` is set; terminal hidden until authenticated |
+| **File browser** | List, upload, download (dirs as `.zip`), rename, delete, new file/dir, right-click menu |
+| **WS Noise encryption** | `Noise_NN_25519_ChaChaPoly_SHA256` enabled by default — no TLS cert required |
+| **Basic Auth & proxy auth** | `-c user:pass` or delegate to upstream via `--auth-header` |
+| **IP allowlist** | CIDR-based filtering with `--allow-ip` |
+| **lrzsz transfer** | `rz`/`sz` file transfer with first-login hint |
+| **Audit log** | JSONL structured log of every connection, command, and file operation |
+| **Sub-path mount** | `--base-path` for reverse-proxy deployments |
+| **Read-only mode** | `--readonly` disables all terminal input |
+| **Single binary** | Frontend assets gzip-embedded at build time — nothing to deploy separately |
+
+---
 
 ## Quick Start
 
@@ -32,13 +54,17 @@ A Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd) — share your termina
 # Linux / macOS
 cargo run -- -c admin:admin --port 7681 bash
 
-# Windows
+# Windows (cmd)
 cargo run -- -c admin:admin --port 7681 cmd
+
+# Windows (PowerShell)
+cargo run -- -c admin:admin --port 7681 powershell
 ```
 
-Open `http://localhost:7681`, sign in with `admin / admin`.
+Open `http://localhost:7681` and sign in with `admin / admin`.
 
-### Common options
+<details>
+<summary>More options</summary>
 
 ```bash
 # Disable WS Noise (plain WebSocket)
@@ -47,21 +73,62 @@ cargo run -- --disable-ws-noise -c admin:admin --port 7681 bash
 # Enable audit log
 cargo run -- --audit-log ./audit.log -c admin:admin --port 7681 bash
 
-# Read-only terminal (no keyboard input forwarded)
+# Read-only terminal (view only, no input)
 cargo run -- --readonly -c admin:admin --port 7681 bash
 
 # Set file browser root to a specific directory
 cargo run -- --cwd /srv/data -c admin:admin --port 7681 bash
 ```
 
+</details>
+
+---
+
+## Windows
+
+ttyd-rs runs natively on Windows — no WSL or Cygwin required.
+
+**Prerequisites**
+
+- [Rust](https://rustup.rs/) (stable)
+- [Node.js](https://nodejs.org/) 18+ (for the frontend build step)
+- [NASM](https://www.nasm.us/) (required by `aws-lc-sys`; add to `PATH`)
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload
+
+**Build & run**
+
+```powershell
+cargo build --release
+# Output: target\release\ttyd.exe
+
+.\target\release\ttyd.exe -c admin:admin --port 7681 cmd
+```
+
+**Supported shells on Windows**
+
+| Shell | Command |
+|-------|---------|
+| Command Prompt | `ttyd.exe ... cmd` |
+| PowerShell | `ttyd.exe ... powershell` |
+| PowerShell 7 | `ttyd.exe ... pwsh` |
+| Git Bash | `ttyd.exe ... "C:\Program Files\Git\bin\bash.exe"` |
+| WSL | `ttyd.exe ... wsl` |
+
+> **Note:** `lrzsz` (`rz`/`sz`) is a Linux/macOS utility and is not available natively on Windows. All other features work cross-platform.
+
+---
+
 ## Build
 
-`build.rs` automatically runs `npm install && npm run build` inside `frontend/` and embeds the output:
+`build.rs` automatically runs `npm install && npm run build` inside `frontend/` and embeds the output into the binary:
 
 ```bash
 cargo build --release
-# Output: target/release/ttyd  (or ttyd.exe on Windows)
+# Linux/macOS → target/release/ttyd
+# Windows     → target\release\ttyd.exe
 ```
+
+---
 
 ## Docker
 
@@ -79,7 +146,7 @@ docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" ttyd-rs:latest
 
 ### Full Ubuntu image (`Dockerfile.ubuntu`)
 
-Pre-installed: vim, zsh, git, curl, wget, htop, jq, python3, ripgrep, lrzsz, and more. Apt/pip are configured with Aliyun mirrors for fast installs in China.
+Pre-installed: vim, zsh, git, curl, wget, htop, jq, python3, ripgrep, lrzsz, and more.
 
 ```bash
 docker build -f Dockerfile.ubuntu -t ttyd-rs-ubuntu:latest .
@@ -92,13 +159,14 @@ docker run --rm -p 7681:7681 -e TTYD_ARGS="-c admin:admin" lihongjie0209/ttyd-rs
 
 The `docker-entrypoint.sh` reads `TTYD_ARGS` and prepends them to the command.
 
+---
+
 ## Nginx Reverse Proxy
 
-ttyd-rs uses WebSocket (with optional Noise encryption) and needs proper proxy headers. Below are common nginx configurations.
+ttyd-rs uses WebSocket (with optional Noise encryption) and requires proper proxy headers.
 
-### Basic HTTP proxy
-
-Start ttyd-rs (listens on localhost only, with auth):
+<details>
+<summary>Basic HTTP proxy</summary>
 
 ```bash
 ttyd -p 7681 -c admin:secret bash
@@ -113,29 +181,29 @@ server {
         proxy_pass         http://127.0.0.1:7681;
         proxy_http_version 1.1;
 
-        # WebSocket upgrade
         proxy_set_header Upgrade    $http_upgrade;
         proxy_set_header Connection "upgrade";
 
-        # Pass real client info
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # Timeouts — keep WS alive
         proxy_read_timeout  3600s;
         proxy_send_timeout  3600s;
     }
 }
 ```
 
-### HTTPS + WSS (recommended for production)
+</details>
 
-Start ttyd-rs on localhost only. Noise encryption can be disabled when TLS is provided by nginx:
+<details>
+<summary>HTTPS + WSS (recommended for production)</summary>
+
+Noise encryption can be disabled when TLS is terminated by nginx:
 
 ```bash
-ttyd -p 7681 -c admin:secret --disable-noise bash
+ttyd -p 7681 -c admin:secret --disable-ws-noise bash
 ```
 
 ```nginx
@@ -165,7 +233,6 @@ server {
     }
 }
 
-# Redirect HTTP → HTTPS
 server {
     listen 80;
     server_name terminal.example.com;
@@ -173,44 +240,39 @@ server {
 }
 ```
 
-### Sub-path proxy (`--base-path`)
+</details>
 
-Mount ttyd-rs under a sub-path so it coexists with other services on the same domain:
+<details>
+<summary>Sub-path proxy (--base-path)</summary>
 
 ```bash
 ttyd -p 7681 -c admin:secret --base-path /ttyd bash
 ```
 
-Then proxy only that prefix in nginx:
-
 ```nginx
-server {
-    listen 443 ssl http2;
-    server_name example.com;
+location /ttyd/ {
+    proxy_pass         http://127.0.0.1:7681/ttyd/;
+    proxy_http_version 1.1;
 
-    # ... other locations ...
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
 
-    location /ttyd/ {
-        proxy_pass         http://127.0.0.1:7681/ttyd/;
-        proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
 
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-
-        proxy_read_timeout  3600s;
-        proxy_send_timeout  3600s;
-    }
+    proxy_read_timeout  3600s;
+    proxy_send_timeout  3600s;
 }
 ```
 
-### Proxy auth header
+</details>
 
-Let nginx handle authentication and forward the authenticated username to ttyd-rs via a trusted header. ttyd-rs skips its own credential check and uses the header value as the username:
+<details>
+<summary>Proxy auth header (--auth-header)</summary>
+
+Delegate authentication to nginx and pass the username via a trusted header:
 
 ```bash
 ttyd -p 7681 --auth-header X-Remote-User bash
@@ -237,7 +299,11 @@ location / {
 }
 ```
 
-> **Note:** When using `--auth-header`, never allow external clients to set that header directly — block it at the nginx boundary.
+> **Warning:** Never allow external clients to inject the auth header directly — block it at the nginx boundary.
+
+</details>
+
+---
 
 ## Integration Tests
 
@@ -247,15 +313,30 @@ python scripts/integration_test.py
 
 Covers: auth, IP allowlist, file API CRUD, path-traversal rejection, WS regression, base-path.
 
+---
+
 ## CI / Releases
 
-GitHub Actions workflow: `.github/workflows/release.yml`
+GitHub Actions (`.github/workflows/release.yml`):
 
 - Triggers on `v*` tag push or manual dispatch
 - Builds on `ubuntu-latest` and `macos-latest`
-- Artifacts: `ttyd-${platform}.tar.gz` uploaded to GitHub Release
+- Artifacts: `ttyd-${platform}.tar.gz` uploaded to GitHub Releases
+
+---
+
+## Platform Support
+
+| Platform | Status |
+|----------|--------|
+| Linux (x86_64 / ARM64) | ✅ Fully supported |
+| macOS (x86_64 / Apple Silicon) | ✅ Fully supported |
+| Windows 10/11 (x86_64) | ✅ Fully supported |
+
+---
 
 ## Security Notes
 
-- **WS Noise (Noise_NN)** encrypts payloads but does **not** authenticate the server. Use HTTPS/TLS in front of ttyd-rs in production.
-- Set a strong `--credential` and restrict access with `--allow-ip` or a reverse proxy.
+- **WS Noise (Noise_NN)** encrypts the WebSocket payload but does **not** authenticate the server identity. Use HTTPS/TLS termination in production.
+- Always set a strong `--credential` and restrict network access with `--allow-ip` or a reverse proxy.
+- Run ttyd-rs bound to `localhost` only and let nginx handle public-facing TLS.

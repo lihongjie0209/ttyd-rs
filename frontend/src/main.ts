@@ -12,6 +12,7 @@ import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { concatBytes, randomBytes } from '@noble/hashes/utils.js';
+import * as monaco from 'monaco-editor';
 
 // ── ttyd protocol constants ──────────────────────────────────────────────────
 
@@ -489,6 +490,12 @@ function hideContextMenu() {
 }
 
 function showContextMenu(x: number, y: number) {
+    // Show "编辑" only for files, not directories
+    const editBtn = fileContextMenu.querySelector('button[data-action="edit"]') as HTMLButtonElement | null;
+    if (editBtn) {
+        const isDir = selectedIsDir();
+        editBtn.style.display = isDir ? 'none' : '';
+    }
     const maxX = window.innerWidth - fileContextMenu.offsetWidth - 8;
     const maxY = window.innerHeight - fileContextMenu.offsetHeight - 8;
     fileContextMenu.style.left = `${Math.max(8, Math.min(x, maxX))}px`;
@@ -706,6 +713,9 @@ fileContextMenu.addEventListener('click', (ev) => {
         case 'new-dir':
             void createNewDir();
             break;
+        case 'edit':
+            void openFileInEditor(selectedPath);
+            break;
         case 'rename':
             void renameSelected();
             break;
@@ -715,6 +725,158 @@ fileContextMenu.addEventListener('click', (ev) => {
         default:
             break;
     }
+});
+
+// ── Monaco Editor ────────────────────────────────────────────────────────────
+
+// Configure Monaco to use empty inline workers so it doesn't request external worker files.
+// Syntax highlighting (Monarch tokenizers) runs on the main thread; workers only add
+// IntelliSense/validation which we don't need for a basic file editor.
+(window as any).MonacoEnvironment = {
+    getWorker(_moduleId: string, _label: string) {
+        const blob = new Blob([''], { type: 'application/javascript' });
+        return new Worker(URL.createObjectURL(blob));
+    },
+};
+
+const editorPane = document.getElementById('editor-pane') as HTMLDivElement;
+const editorContainer = document.getElementById('editor-container') as HTMLDivElement;
+const editorFilename = document.getElementById('editor-filename') as HTMLSpanElement;
+const editorDirtyDot = document.getElementById('editor-dirty-dot') as HTMLSpanElement;
+const editorLangBadge = document.getElementById('editor-lang-badge') as HTMLSpanElement;
+const editorSaveBtn = document.getElementById('editor-save-btn') as HTMLButtonElement;
+const editorCloseBtn = document.getElementById('editor-close-btn') as HTMLButtonElement;
+
+let editorInstance: monaco.editor.IStandaloneCodeEditor | null = null;
+let currentEditorPath = '';
+let editorDirty = false;
+
+function getMonacoLang(filename: string): string {
+    const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+    const map: Record<string, string> = {
+        ts: 'typescript', tsx: 'typescript',
+        js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
+        rs: 'rust',
+        py: 'python',
+        json: 'json', jsonc: 'json',
+        html: 'html', htm: 'html',
+        css: 'css', scss: 'scss', less: 'less',
+        md: 'markdown', markdown: 'markdown',
+        sh: 'shell', bash: 'shell', zsh: 'shell', fish: 'shell',
+        yaml: 'yaml', yml: 'yaml',
+        toml: 'ini',
+        xml: 'xml', svg: 'xml',
+        sql: 'sql',
+        go: 'go',
+        java: 'java',
+        c: 'c', h: 'c',
+        cpp: 'cpp', cc: 'cpp', cxx: 'cpp', hpp: 'cpp',
+        cs: 'csharp',
+        rb: 'ruby',
+        php: 'php',
+        swift: 'swift',
+        kt: 'kotlin', kts: 'kotlin',
+        dockerfile: 'dockerfile',
+        makefile: 'makefile',
+        ini: 'ini', conf: 'ini', cfg: 'ini',
+        txt: 'plaintext',
+    };
+    // Special filenames
+    const lower = filename.toLowerCase();
+    if (lower === 'dockerfile') return 'dockerfile';
+    if (lower === 'makefile' || lower === 'gnumakefile') return 'makefile';
+    return map[ext] ?? 'plaintext';
+}
+
+function setEditorDirty(dirty: boolean) {
+    editorDirty = dirty;
+    editorDirtyDot.classList.toggle('hidden', !dirty);
+}
+
+async function openFileInEditor(path: string): Promise<void> {
+    if (!path || path === '') {
+        await uiAlert('请先选择一个文件');
+        return;
+    }
+    // Check if it looks like a directory (no extension is fine, we try to open)
+    try {
+        const result = await wsRpc<{ path: string; content_base64: string; size: number }>('file.read', { path });
+        const filename = path.split('/').pop() ?? path;
+        const lang = getMonacoLang(filename);
+        const content = atob(result.content_base64);
+
+        currentEditorPath = path;
+
+        if (!editorInstance) {
+            editorInstance = monaco.editor.create(editorContainer, {
+                value: content,
+                language: lang,
+                theme: 'vs-dark',
+                automaticLayout: true,
+                fontSize: 13,
+                fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                minimap: { enabled: true },
+                scrollBeyondLastLine: false,
+                wordWrap: 'off',
+                tabSize: 4,
+                renderWhitespace: 'selection',
+                lineNumbers: 'on',
+                folding: true,
+                bracketPairColorization: { enabled: true },
+                suggestOnTriggerCharacters: true,
+            });
+            editorInstance.onDidChangeModelContent(() => {
+                if (!editorDirty) setEditorDirty(true);
+            });
+            editorInstance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+                void saveCurrentFile();
+            });
+        } else {
+            const model = editorInstance.getModel();
+            if (model) {
+                monaco.editor.setModelLanguage(model, lang);
+                editorInstance.setValue(content);
+            } else {
+                const newModel = monaco.editor.createModel(content, lang);
+                editorInstance.setModel(newModel);
+            }
+        }
+
+        editorFilename.textContent = filename;
+        editorLangBadge.textContent = lang;
+        setEditorDirty(false);
+
+        editorPane.classList.remove('hidden');
+    } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        await uiAlert(`无法打开文件: ${msg}`);
+    }
+}
+
+async function saveCurrentFile(): Promise<void> {
+    if (!editorInstance || !currentEditorPath) return;
+    const content = editorInstance.getValue();
+    // Encode content to base64
+    const bytes = new TextEncoder().encode(content);
+    const content_base64 = bytesToBase64(bytes);
+    try {
+        await wsRpc('file.write', { path: currentEditorPath, content_base64 });
+        setEditorDirty(false);
+    } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        await uiAlert(`保存失败: ${msg}`);
+    }
+}
+
+editorSaveBtn.addEventListener('click', () => { void saveCurrentFile(); });
+
+editorCloseBtn.addEventListener('click', async () => {
+    if (editorDirty) {
+        if (!(await uiConfirm('文件有未保存的修改，确认关闭？'))) return;
+    }
+    editorPane.classList.add('hidden');
+    currentEditorPath = '';
+    setEditorDirty(false);
 });
 
 // ── overlay helpers ──────────────────────────────────────────────────────────
