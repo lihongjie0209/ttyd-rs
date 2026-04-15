@@ -31,7 +31,7 @@ pub struct ServerState {
     pub client_count: Mutex<i32>,
     /// Client JSON preferences string (sent via SET_PREFERENCES)
     pub prefs_json: String,
-    /// Base64-encoded credential for Basic Auth (None = no auth)
+    /// Base64-encoded "username:password" credential for login validation (None = no auth)
     pub credential: Option<String>,
     /// HTTP header name used for proxy authentication
     pub auth_header: Option<String>,

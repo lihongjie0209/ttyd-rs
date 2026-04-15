@@ -58,7 +58,7 @@ struct Cli {
     )]
     socket_owner: Option<String>,
 
-    #[arg(short = 'c', long, help = "Basic auth credential (username:password)")]
+    #[arg(short = 'c', long, help = "Login credential (username:password)")]
     credential: Option<String>,
 
     #[arg(long, help = "Username for authentication")]

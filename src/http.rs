@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use subtle::ConstantTimeEq;
 use tokio::fs;
@@ -17,6 +17,11 @@ use crate::audit::AuditEvent;
 use crate::server::SharedState;
 
 const SESSION_COOKIE_NAME: &str = "ttyd_session";
+
+#[derive(Serialize)]
+struct TokenResponse {
+    token: String,
+}
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -110,33 +115,31 @@ pub fn check_auth(headers: &HeaderMap, state: &SharedState) -> Option<String> {
         }
         return None;
     }
-    if let Some(credential) = &state.credential {
+    if let Some(session_token) = &state.session_token {
+        // Accept Bearer token in Authorization header
         let auth_value = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if auth_value.len() > 6
-            && auth_value.starts_with("Basic ")
-            && &auth_value[6..] == credential
-        {
-            let username = STANDARD
-                .decode(&auth_value[6..])
-                .ok()
-                .and_then(|raw| String::from_utf8(raw).ok())
-                .and_then(|text| text.split_once(':').map(|(u, _)| u.to_string()))
-                .unwrap_or_default();
-            return Some(username);
+        if let Some(bearer) = auth_value.strip_prefix("Bearer ") {
+            if bool::from(bearer.as_bytes().ct_eq(session_token.as_bytes())) {
+                return Some("token".to_string());
+            }
+            return None;
         }
-        if let (Some(cookie_header), Some(session_token)) = (
-            headers.get(header::COOKIE).and_then(|v| v.to_str().ok()),
-            state.session_token.as_ref(),
-        ) {
+        // Accept session cookie
+        if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
             if let Some(cookie_val) = parse_cookie_value(cookie_header, SESSION_COOKIE_NAME) {
                 if bool::from(cookie_val.as_bytes().ct_eq(session_token.as_bytes())) {
                     return Some("session".to_string());
                 }
             }
         }
+        return None;
+    }
+    // No auth configured → allow all
+    if state.credential.is_some() {
+        // credential present but session_token is None: server misconfiguration, deny
         return None;
     }
     Some(String::new())
@@ -218,18 +221,20 @@ pub async fn login_submit(
             None,
         ));
     }
+    let body = serde_json::to_string(&TokenResponse { token: session_token.clone() })
+        .unwrap_or_default();
     Response::builder()
-        .status(StatusCode::NO_CONTENT)
+        .status(StatusCode::OK)
         .header(header::SET_COOKIE, cookie)
-        .header(header::CONTENT_LENGTH, "0")
-        .body(Body::empty())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
         .unwrap()
 }
 
 fn unauthorized() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header(header::WWW_AUTHENTICATE, r#"Basic realm="ttyd""#)
         .header(header::CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -238,7 +243,6 @@ fn unauthorized() -> Response {
 fn proxy_auth_required() -> Response {
     Response::builder()
         .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-        .header(header::PROXY_AUTHENTICATE, r#"Basic realm="ttyd""#)
         .header(header::CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
@@ -381,21 +385,44 @@ mod tests {
     }
 
     #[test]
-    fn auth_accepts_valid_basic() {
+    fn auth_accepts_valid_bearer() {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        headers.insert(header::AUTHORIZATION, "Basic dTpw".parse().unwrap());
+        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        headers.insert(header::AUTHORIZATION, "Bearer mytoken123".parse().unwrap());
         assert!(check_auth(&headers, &state).is_some());
     }
 
     #[test]
-    fn auth_rejects_invalid_basic() {
+    fn auth_rejects_invalid_bearer() {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
         Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
-        headers.insert(header::AUTHORIZATION, "Basic invalid".parse().unwrap());
+        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        headers.insert(header::AUTHORIZATION, "Bearer wrongtoken".parse().unwrap());
         assert!(check_auth(&headers, &state).is_none());
+    }
+
+    #[test]
+    fn auth_rejects_basic_header() {
+        let mut headers = HeaderMap::new();
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
+        Arc::get_mut(&mut state).unwrap().session_token = Some("mytoken123".to_string());
+        // Basic auth should no longer be accepted
+        headers.insert(header::AUTHORIZATION, "Basic dTpw".parse().unwrap());
+        assert!(check_auth(&headers, &state).is_none());
+    }
+
+    #[test]
+    fn auth_accepts_session_cookie() {
+        let mut headers = HeaderMap::new();
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
+        Arc::get_mut(&mut state).unwrap().session_token = Some("cookietoken".to_string());
+        headers.insert(header::COOKIE, "ttyd_session=cookietoken".parse().unwrap());
+        assert!(check_auth(&headers, &state).is_some());
     }
 
     #[test]
@@ -411,8 +438,9 @@ mod tests {
     async fn token_endpoint_not_exposed_over_http() {
         let mut headers = HeaderMap::new();
         let mut state = test_state();
-        Arc::get_mut(&mut state).unwrap().credential = Some("abc".to_string());
-        headers.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
+        Arc::get_mut(&mut state).unwrap().session_token = Some("tok".to_string());
+        headers.insert(header::AUTHORIZATION, "Bearer tok".parse().unwrap());
         let resp = handle_request("/token".to_string(), headers, state, None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -432,9 +460,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_basic_auth_returns_401() {
+    async fn unauthenticated_request_shows_login_page() {
         let mut state = test_state();
-        Arc::get_mut(&mut state).unwrap().credential = Some("abc".to_string());
+        Arc::get_mut(&mut state).unwrap().credential = Some(STANDARD.encode("u:p"));
+        Arc::get_mut(&mut state).unwrap().session_token = Some("tok".to_string());
         let resp = handle_request("/".to_string(), HeaderMap::new(), state, None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -448,7 +477,6 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().auth_header = Some("X-Auth-User".to_string());
         let resp = handle_request("/".to_string(), HeaderMap::new(), state, None).await;
         assert_eq!(resp.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-        assert!(resp.headers().contains_key(header::PROXY_AUTHENTICATE));
     }
 
     #[tokio::test]
