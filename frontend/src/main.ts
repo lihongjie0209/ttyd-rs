@@ -879,7 +879,9 @@ async function openFileInEditor(path: string): Promise<void> {
         const result = await wsRpc<{ path: string; content_base64: string; size: number }>('file.read', { path });
         const filename = path.split('/').pop() ?? path;
         const lang = getMonacoLang(filename);
-        const content = atob(result.content_base64);
+        // Decode base64 → bytes → UTF-8 string (handles CJK and all multibyte chars)
+        const bytes = base64ToBytes(result.content_base64);
+        const content = new TextDecoder('utf-8').decode(bytes);
 
         currentEditorPath = path;
 
