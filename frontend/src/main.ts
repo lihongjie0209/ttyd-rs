@@ -442,6 +442,12 @@ function renderTreeRows(parentPathKey: string, depth: number, rows: HTMLLIElemen
             }
             await renderFileTree();
         };
+        if (!item.is_dir) {
+            li.ondblclick = (ev: MouseEvent) => {
+                ev.stopPropagation();
+                void openFileInEditor(item.path);
+            };
+        }
         li.oncontextmenu = async (ev: MouseEvent) => {
             ev.preventDefault();
             selectedPath = item.path;
