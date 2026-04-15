@@ -28,13 +28,14 @@ const SRV_OUTPUT = 0x30; // '0'
 const SRV_SET_TITLE = 0x31; // '1'
 const SRV_SET_PREFS = 0x32; // '2'
 const SRV_RPC = 0x34; // '4'
+const SRV_FS_CHANGE = 0x35; // '5'
 
 /** Noise transport */
 const NOISE_CLIENT_HELLO = 0x90;
 const NOISE_SERVER_HELLO = 0x91;
 const NOISE_DATA = 0x92;
 const NOISE_PROTOCOL = 'Noise_NN_25519_ChaChaPoly_SHA256';
-const PLAINTEXT_SERVER_CMDS = new Set<number>([SRV_OUTPUT, SRV_SET_TITLE, SRV_SET_PREFS, SRV_RPC]);
+const PLAINTEXT_SERVER_CMDS = new Set<number>([SRV_OUTPUT, SRV_SET_TITLE, SRV_SET_PREFS, SRV_RPC, SRV_FS_CHANGE]);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -489,6 +490,31 @@ function defaultCreateDir(): string {
 async function refreshTree() {
     childCache.clear();
     await renderFileTree();
+}
+
+/** Silent background tree refresh triggered by FS change notifications.
+ *  - Does nothing if a modal dialog is open (user may be typing in a rename prompt).
+ *  - Does nothing if the editor is dirty (user is actively editing).
+ *  - Keeps selectedPath, expandedDirs, and editor state fully intact.
+ */
+let silentRefreshPending = false;
+async function silentRefreshTree() {
+    // Skip if a modal is open
+    if (!uiModal.classList.contains('hidden')) return;
+    // Coalesce rapid notifications: if one is already in flight, skip this one
+    if (silentRefreshPending) return;
+    silentRefreshPending = true;
+    try {
+        // Invalidate only the directories currently expanded
+        for (const dir of expandedDirs) {
+            childCache.delete(dir);
+        }
+        await renderFileTree();
+    } catch {
+        // silent — never interrupt user experience with errors
+    } finally {
+        silentRefreshPending = false;
+    }
 }
 
 function hideContextMenu() {
@@ -1232,6 +1258,9 @@ function handleMessage(data: ArrayBuffer) {
             }
             break;
         }
+        case SRV_FS_CHANGE:
+            void silentRefreshTree();
+            break;
         default:
             break;
     }

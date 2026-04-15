@@ -102,6 +102,8 @@ pub struct ServerState {
     pub audit_logger: Option<Arc<AuditLogger>>,
     /// Allowed client IP/CIDR list; empty means allow all
     pub ip_whitelist: Vec<IpNet>,
+    /// Broadcast channel for filesystem change notifications to WS clients
+    pub fs_change_tx: tokio::sync::broadcast::Sender<()>,
     /// URL endpoint paths
     pub endpoints: Endpoints,
     /// Port actually bound (may differ from requested if 0 was given)

@@ -34,6 +34,7 @@ const SRV_OUTPUT: u8 = b'0';
 const SRV_SET_TITLE: u8 = b'1';
 const SRV_SET_PREFS: u8 = b'2';
 const SRV_RPC: u8 = b'4';
+const SRV_FS_CHANGE: u8 = b'5';
 const MAX_WS_FRAME_SIZE: usize = 24 * 1024 * 1024;
 const MAX_WS_INPUT_SIZE: usize = 64 * 1024;
 const MAX_WS_JSON_SIZE: usize = 8 * 1024;
@@ -349,6 +350,9 @@ async fn handle_socket(
     let (pty_event_tx, mut pty_event_rx) = mpsc::channel::<PtyEvent>(256);
     let (ws_reply_tx, mut ws_reply_rx) = mpsc::channel::<Vec<u8>>(256);
 
+    // Subscribe to filesystem change broadcast
+    let mut fs_change_rx = state.fs_change_tx.subscribe();
+
     // Spawn output forwarding task
     let state_for_output = state.clone();
     let actor_for_output = auth_user.clone();
@@ -410,6 +414,18 @@ async fn handle_socket(
                     };
                     if ws_tx.send(Message::Binary(wire.into())).await.is_err() {
                         break;
+                    }
+                }
+                fs_result = fs_change_rx.recv() => {
+                    // Ignore lagged messages; just send a notification
+                    if fs_result.is_ok() || matches!(fs_result, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) {
+                        let wire = match encode_ws_binary(vec![SRV_FS_CHANGE], &mut noise_tx_for_output) {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        };
+                        if ws_tx.send(Message::Binary(wire.into())).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }

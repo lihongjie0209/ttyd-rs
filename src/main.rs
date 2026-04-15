@@ -1,6 +1,7 @@
 mod assets;
 mod audit;
 mod file_api;
+mod fs_watch;
 mod http;
 mod noise;
 mod pty;
@@ -323,6 +324,7 @@ fn build_state(
         audit_logger,
         ip_whitelist,
         endpoints,
+        fs_change_tx: tokio::sync::broadcast::channel(4).0,
         bound_port: std::sync::atomic::AtomicI32::new(0),
     })
 }
@@ -497,6 +499,18 @@ async fn main() -> anyhow::Result<()> {
         lrzsz_supported,
         audit_logger,
     );
+
+    // Start filesystem watcher if a root directory is configured
+    {
+        let root = if let Some(ref cwd) = state.cwd {
+            std::path::PathBuf::from(cwd)
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        };
+        if let Ok(canonical) = std::fs::canonicalize(&root) {
+            fs_watch::spawn_watcher(canonical, state.fs_change_tx.clone());
+        }
+    }
     info!(
         "ttyd-rs {} | command: {} | signal: {} ({})",
         env!("CARGO_PKG_VERSION"),
