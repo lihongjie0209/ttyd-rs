@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use axum::{
+    body::Body,
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
+    response::Response,
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -15,11 +17,14 @@ use std::{
 };
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use zip::write::FileOptions;
 
 use crate::{audit::AuditEvent, http::check_auth, server::SharedState};
 
 const MAX_RPC_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Files above this size (50 MB) are offered gzip compression on the frontend
+pub const LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024;
 
 #[derive(Serialize)]
 pub struct ApiResponse<T>
@@ -767,6 +772,30 @@ pub async fn handle_ws_rpc(
             );
             Ok(serde_json::json!({ "path": rel, "size": bytes.len() }))
         }
+        "file.stat" => {
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("path is required".to_string());
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat failed: {e}"))?;
+            let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+            Ok(serde_json::json!({
+                "path": rel,
+                "name": name,
+                "size": meta.len(),
+                "is_dir": meta.is_dir(),
+            }))
+        }
         "health.live" => Ok(serde_json::json!({ "status": "ok" })),
         "health.ready" => {
             let clients = *state.client_count.lock().await;
@@ -1030,4 +1059,161 @@ pub async fn delete(
         None,
     );
     Ok(Json(ApiResponse::ok(serde_json::json!({ "path": rel }))))
+}
+
+// ── HTTP streaming download ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DownloadQuery {
+    pub path: Option<String>,
+    /// "1" = gzip-compress the file before sending
+    pub compress: Option<String>,
+}
+
+fn err_response(status: StatusCode, msg: &str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(msg.to_string()))
+        .unwrap()
+}
+
+/// `GET /download?path=<rel>&compress=0|1`
+/// Streams files (and directories as zip) directly without the 8 MB WS limit.
+/// Supports optional gzip compression for single files via `?compress=1`.
+pub async fn download_file(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    client: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    Query(q): Query<DownloadQuery>,
+) -> Response {
+    let ip = client.map(|c| c.0.ip());
+    let actor = match check_auth(&headers, &state) {
+        Some(u) => u,
+        None => return err_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+    };
+
+    let rel = match q.path.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => match normalize_rel_path(p) {
+            Ok(n) => rel_to_string(&n),
+            Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
+        },
+        None => return err_response(StatusCode::BAD_REQUEST, "path is required"),
+    };
+    if rel.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "path is required");
+    }
+
+    let root = match canonical_root_dir(&state) {
+        Ok(r) => r,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+
+    let target = match resolve_target(&root, &rel) {
+        Ok(t) => t,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let target = match canonicalize_in_root(&root, &target) {
+        Ok(t) => t,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let meta = match fs::metadata(&target).await {
+        Ok(m) => m,
+        Err(e) => return err_response(StatusCode::NOT_FOUND, &format!("stat failed: {e}")),
+    };
+
+    let compress = q.compress.as_deref() == Some("1");
+    let is_dir = meta.is_dir();
+
+    if is_dir {
+        // Directories: always zip regardless of compress flag
+        let zip_path = match tokio::task::spawn_blocking({
+            let t = target.clone();
+            move || create_temp_zip_from_dir(&t)
+        })
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("zip task: {e}")),
+        };
+
+        let filename = download_name(&rel, true);
+        let disposition = format!("attachment; filename=\"{}\"", filename);
+        let zip_file = match tokio::fs::File::open(&zip_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&zip_path).await;
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open zip: {e}"));
+            }
+        };
+        let stream = ReaderStream::new(zip_file);
+        // Clean up temp file after open (OS keeps file alive until closed on Unix)
+        // On Windows we can't delete while open — best effort
+        let _ = tokio::fs::remove_file(&zip_path).await;
+
+        audit_log(&state, &actor, ip, "file_download", Some(rel), true, Some("dir=true".into()));
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/zip")
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    if compress {
+        // Gzip: compress in blocking task, then stream
+        let filename = format!("{}.gz", download_name(&rel, false));
+        let disposition = format!("attachment; filename=\"{}\"", filename);
+        let target_clone = target.clone();
+        let gz_bytes = match tokio::task::spawn_blocking(move || {
+            use flate2::{write::GzEncoder, Compression};
+            let data = std::fs::read(&target_clone)
+                .map_err(|e| format!("read failed: {e}"))?;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&data).map_err(|e| format!("compress failed: {e}"))?;
+            enc.finish().map_err(|e| format!("finalize failed: {e}"))
+        })
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("task: {e}")),
+        };
+
+        let size = gz_bytes.len();
+        audit_log(&state, &actor, ip, "file_download", Some(rel), true,
+            Some(format!("size={size},compressed=true")));
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .header(header::CONTENT_LENGTH, size)
+            .body(Body::from(gz_bytes))
+            .unwrap();
+    }
+
+    // Raw streaming download — no size limit, no buffering
+    let filename = download_name(&rel, false);
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+    let file_size = meta.len();
+    let file = match tokio::fs::File::open(&target).await {
+        Ok(f) => f,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open: {e}")),
+    };
+    let stream = ReaderStream::new(file);
+
+    audit_log(&state, &actor, ip, "file_download", Some(rel), true,
+        Some(format!("size={file_size},compressed=false")));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::CONTENT_LENGTH, file_size)
+        .body(Body::from_stream(stream))
+        .unwrap()
 }

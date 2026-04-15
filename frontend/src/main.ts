@@ -625,15 +625,59 @@ async function uploadSelected() {
     await uploadToDir(defaultCreateDir());
 }
 
+async function uiDownloadChoice(sizeMB: string): Promise<'compress' | 'direct' | 'cancel'> {
+    return new Promise((resolve) => {
+        uiModalTitle.textContent = '大文件下载';
+        uiModalMessage.textContent = `文件较大（${sizeMB} MB），建议压缩（gzip）后下载以节省传输时间。`;
+        uiModal.classList.remove('hidden');
+        uiModalInput.classList.add('hidden');
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.textContent = '取消';
+        cancelBtn.className = uiModalCancelBtn.className;
+        uiModalOkBtn.textContent = '压缩后下载';
+        uiModalCancelBtn.textContent = '直接下载';
+        uiModalCancelBtn.classList.remove('hidden');
+        uiModalCancelBtn.after(cancelBtn);
+
+        const done = (result: 'compress' | 'direct' | 'cancel') => {
+            uiModal.classList.add('hidden');
+            uiModalOkBtn.textContent = '确认';
+            uiModalCancelBtn.textContent = '取消';
+            uiModalOkBtn.onclick = null;
+            uiModalCancelBtn.onclick = null;
+            uiModal.onclick = null;
+            cancelBtn.remove();
+            resolve(result);
+        };
+
+        uiModalOkBtn.onclick = () => done('compress');
+        uiModalCancelBtn.onclick = () => done('direct');
+        cancelBtn.onclick = () => done('cancel');
+        uiModal.onclick = (ev) => { if (ev.target === uiModal) done('cancel'); };
+        queueMicrotask(() => uiModalOkBtn.focus());
+    });
+}
+
+const LARGE_FILE_BYTES = 50 * 1024 * 1024; // 50 MB
+
 async function downloadSelected() {
     if (!selectedPath) {
         await uiAlert('请先选择要下载的文件或目录');
         return;
     }
     try {
-        const data = await wsRpc<{ name: string; content_base64: string }>('file.download', { path: selectedPath });
-        const bytes = base64ToBytes(data.content_base64);
-        saveBlob(data.name || 'download.bin', [bytes]);
+        const stat = await wsRpc<{ size: number; is_dir: boolean; name: string }>('file.stat', { path: selectedPath });
+        let compress = false;
+        if (!stat.is_dir && stat.size >= LARGE_FILE_BYTES) {
+            const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
+            const choice = await uiDownloadChoice(sizeMB);
+            if (choice === 'cancel') return;
+            compress = choice === 'compress';
+        }
+        const params = new URLSearchParams({ path: selectedPath });
+        if (compress) params.set('compress', '1');
+        window.open(`/download?${params.toString()}`, '_blank');
     } catch (e) {
         await uiAlert(String(e), '下载失败');
     }

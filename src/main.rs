@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, Json, State, WebSocketUpgrade},
+    extract::{ConnectInfo, Json, Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
@@ -392,6 +392,29 @@ async fn route_logout_post(
     http::logout(State(state), headers).await
 }
 
+async fn route_download(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    Query(q): Query<file_api::DownloadQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let client_ip = peer.map(|p| p.0.ip());
+    if !state.is_ip_allowed(client_ip) {
+        return axum::response::Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(axum::body::Body::from("forbidden"))
+            .unwrap();
+    }
+    file_api::download_file(
+        State(state),
+        headers,
+        peer,
+        Query(q),
+    )
+    .await
+}
+
 fn make_addr(cli: &Cli) -> anyhow::Result<SocketAddr> {
     let host = match cli.interface.as_deref() {
         Some(i) if i.ends_with(".sock") || i.ends_with(".socket") => "0.0.0.0",
@@ -532,6 +555,7 @@ async fn main() -> anyhow::Result<()> {
         .route(&ws_path, get(route_ws))
         .route(&login_path, get(route_login_get).post(route_login_post))
         .route(&logout_path, post(route_logout_post))
+        .route("/download", get(route_download))
         .fallback(route_http)
         .with_state(state.clone());
 
