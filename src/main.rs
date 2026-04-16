@@ -13,8 +13,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, Json, Query, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode, Uri},
+    extract::{ConnectInfo, DefaultBodyLimit, Json, Query, State, WebSocketUpgrade},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware,
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -395,7 +396,6 @@ async fn route_logout_post(
 
 async fn route_download(
     State(state): State<SharedState>,
-    headers: HeaderMap,
     peer: Option<ConnectInfo<SocketAddr>>,
     Query(q): Query<file_api::DownloadQuery>,
 ) -> axum::response::Response {
@@ -409,11 +409,33 @@ async fn route_download(
     }
     file_api::download_file(
         State(state),
-        headers,
-        peer,
         Query(q),
     )
     .await
+}
+
+/// Middleware that injects security-related HTTP response headers on every request.
+async fn security_headers_middleware(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let h = response.headers_mut();
+    h.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    h.insert("X-XSS-Protection", HeaderValue::from_static("1; mode=block"));
+    h.insert(
+        "Referrer-Policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    if state.tls_enabled {
+        h.insert(
+            "Strict-Transport-Security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
 }
 
 fn make_addr(cli: &Cli) -> anyhow::Result<SocketAddr> {
@@ -552,6 +574,20 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
         }
+
+        // Periodic cleanup of expired session tokens (every 5 minutes)
+        {
+            let st = state.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    if let Ok(mut map) = st.token_store.lock() {
+                        map.retain(|_, v| v.expires_at > std::time::Instant::now());
+                    }
+                }
+            });
+        }
     }
     info!(
         "ttyd-rs {} | command: {} | signal: {} ({})",
@@ -572,10 +608,23 @@ async fn main() -> anyhow::Result<()> {
     let logout_path = state.endpoints.logout.clone();
     let app = Router::new()
         .route(&ws_path, get(route_ws))
-        .route(&login_path, get(route_login_get).post(route_login_post))
+        // Login endpoint: apply a tight body limit (8 KiB) to prevent memory exhaustion
+        .route(
+            &login_path,
+            get(route_login_get)
+                .post(route_login_post)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(&logout_path, post(route_logout_post))
         .route("/download", get(route_download))
         .fallback(route_http)
+        // Global body limit: covers file RPC uploads (max 8 MiB base64-encoded ≈ ~11 MiB wire)
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        // Security headers on every response
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers_middleware,
+        ))
         .with_state(state.clone());
 
     // UNIX domain socket

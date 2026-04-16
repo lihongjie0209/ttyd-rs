@@ -1,17 +1,14 @@
-#![allow(dead_code)]
-
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Query, State},
+    http::{header, StatusCode},
     response::Response,
-    Json,
 };
 use async_compression::tokio::bufread::GzipEncoder;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -19,56 +16,9 @@ use tokio::fs;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
 
-use crate::{audit::AuditEvent, http::check_auth, server::{DownloadTokenEntry, SharedState, DOWNLOAD_TOKEN_TTL_SECS}};
+use crate::{audit::AuditEvent, server::{DownloadTokenEntry, SharedState, DOWNLOAD_TOKEN_TTL_SECS}};
 
 const MAX_RPC_FILE_BYTES: usize = 8 * 1024 * 1024;
-/// Files above this size (50 MB) are offered gzip compression on the frontend
-pub const LARGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024;
-
-#[derive(Serialize)]
-pub struct ApiResponse<T>
-where
-    T: Serialize,
-{
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl<T> ApiResponse<T>
-where
-    T: Serialize,
-{
-    fn ok(data: T) -> Self {
-        Self {
-            ok: true,
-            data: Some(data),
-            error: None,
-        }
-    }
-}
-
-impl ApiResponse<()> {
-    fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            data: None,
-            error: Some(msg.into()),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ListQuery {
-    pub path: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ListResult {
-    pub entries: Vec<FileEntry>,
-}
 
 #[derive(Serialize, Clone)]
 pub struct FileEntry {
@@ -76,35 +26,6 @@ pub struct FileEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
-}
-
-#[derive(Deserialize)]
-pub struct CreateRequest {
-    pub path: String,
-    pub name: String,
-}
-
-#[derive(Deserialize)]
-pub struct RenameRequest {
-    pub path: String,
-    pub new_name: String,
-}
-
-#[derive(Deserialize)]
-pub struct DeleteRequest {
-    pub path: String,
-}
-
-fn unauthorized_status(state: &SharedState) -> StatusCode {
-    if state.auth_header.is_some() {
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED
-    } else {
-        StatusCode::UNAUTHORIZED
-    }
-}
-
-fn current_ip(client: Option<ConnectInfo<SocketAddr>>) -> Option<IpAddr> {
-    client.map(|c| c.ip())
 }
 
 fn ip_text(ip: Option<IpAddr>) -> Option<String> {
@@ -139,47 +60,6 @@ fn audit_log(
             message,
         ));
     }
-}
-
-fn ensure_allowed(
-    state: &SharedState,
-    headers: &HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-) -> Result<(String, Option<IpAddr>), (StatusCode, Json<ApiResponse<()>>)> {
-    let ip = current_ip(client);
-    if let Some(addr) = ip {
-        if !state.is_ip_allowed(Some(addr)) {
-            audit_log(
-                state,
-                "anonymous",
-                ip,
-                "file_api_auth",
-                None,
-                false,
-                Some("forbidden: ip not in whitelist".to_string()),
-            );
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ApiResponse::err("forbidden: ip not in whitelist")),
-            ));
-        }
-    }
-    let Some(actor) = check_auth(headers, state) else {
-        audit_log(
-            state,
-            "anonymous",
-            ip,
-            "file_api_auth",
-            None,
-            false,
-            Some("authentication required".to_string()),
-        );
-        return Err((
-            unauthorized_status(state),
-            Json(ApiResponse::err("authentication required")),
-        ));
-    };
-    Ok((actor, ip))
 }
 
 fn root_dir(state: &SharedState) -> Result<PathBuf, String> {
@@ -277,18 +157,25 @@ impl std::io::Write for SyncDuplexWriter {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-fn make_temp_zip_path() -> PathBuf {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("ttyd-rs-download-{}-{millis}.zip", std::process::id()))
+/// Build a safe `Content-Disposition: attachment` header value using RFC 6266 / RFC 5987
+/// encoding so that filenames with special characters or quotes cannot inject headers.
+pub fn content_disposition_attachment(filename: &str) -> String {
+    // ASCII fallback: strip characters that could break the quoted-string
+    let ascii_safe: String = filename
+        .chars()
+        .map(|c| if c == '"' || c == '\\' || c == '\n' || c == '\r' { '_' } else { c })
+        .collect();
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_safe,
+        urlencoding::encode(filename)
+    )
 }
-
-#[allow(dead_code)]
 
 async fn list_entries(root: &Path, rel_path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = resolve_target(root, rel_path)?;
+    // Resolve symlinks and verify the directory stays within root
+    let dir_path = canonicalize_in_root(root, &dir_path)?;
     let meta = fs::metadata(&dir_path)
         .await
         .map_err(|e| format!("stat path failed: {e}"))?;
@@ -807,262 +694,6 @@ pub async fn handle_ws_rpc(
     }
 }
 
-pub async fn list_files(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Query(q): Query<ListQuery>,
-) -> Result<Json<ApiResponse<ListResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
-    let root = canonical_root_dir(&state)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
-    let rel = q.path.unwrap_or_default();
-    let rel_norm = normalize_rel_path(&rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let rel_s = rel_to_string(&rel_norm);
-    let entries = list_entries(&root, &rel_s)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    audit_log(
-        &state,
-        &actor,
-        ip,
-        "file_list",
-        Some(rel_s),
-        true,
-        Some(format!("entries={}", entries.len())),
-    );
-    Ok(Json(ApiResponse::ok(ListResult { entries })))
-}
-
-pub async fn mkdir(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Json(req): Json<CreateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
-    let root = canonical_root_dir(&state)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
-    let parent_rel = rel_to_string(
-        &normalize_rel_path(&req.path)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?,
-    );
-    let name = sanitize_name(&req.name)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_target = resolve_target(&root, &parent_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_canonical = canonicalize_in_root(&root, &parent_target)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_meta = std::fs::metadata(&parent_canonical).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("stat parent failed: {e}"))),
-        )
-    })?;
-    if !parent_meta.is_dir() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err("parent is not a directory")),
-        ));
-    }
-    let target_rel = join_rel(&parent_rel, &name);
-    let target = parent_canonical.join(&name);
-    resolve_target(&root, &target_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    fs::create_dir(&target).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("mkdir failed: {e}"))),
-        )
-    })?;
-    audit_log(
-        &state,
-        &actor,
-        ip,
-        "file_mkdir",
-        Some(target_rel.clone()),
-        true,
-        None,
-    );
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "path": target_rel }),
-    )))
-}
-
-pub async fn new_file(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Json(req): Json<CreateRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
-    let root = canonical_root_dir(&state)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
-    let parent_rel = rel_to_string(
-        &normalize_rel_path(&req.path)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?,
-    );
-    let name = sanitize_name(&req.name)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_target = resolve_target(&root, &parent_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_canonical = canonicalize_in_root(&root, &parent_target)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_meta = std::fs::metadata(&parent_canonical).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("stat parent failed: {e}"))),
-        )
-    })?;
-    if !parent_meta.is_dir() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err("parent is not a directory")),
-        ));
-    }
-    let target_rel = join_rel(&parent_rel, &name);
-    let target = parent_canonical.join(&name);
-    resolve_target(&root, &target_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(target)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::err(format!("create file failed: {e}"))),
-            )
-        })?;
-    audit_log(
-        &state,
-        &actor,
-        ip,
-        "file_new",
-        Some(target_rel.clone()),
-        true,
-        None,
-    );
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "path": target_rel }),
-    )))
-}
-
-pub async fn rename(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Json(req): Json<RenameRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
-    let root = canonical_root_dir(&state)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
-    let src_rel = rel_to_string(
-        &normalize_rel_path(&req.path)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?,
-    );
-    if src_rel.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err("cannot rename root")),
-        ));
-    }
-    let new_name = sanitize_name(&req.new_name)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let parent_rel = src_rel
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-        .unwrap_or_default();
-    let dst_rel = join_rel(&parent_rel, &new_name);
-    let src = resolve_target(&root, &src_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let src_canonical = canonicalize_in_root(&root, &src)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let dst_parent_target = resolve_target(&root, &parent_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let dst_parent_canonical = canonicalize_in_root(&root, &dst_parent_target)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let dst = dst_parent_canonical.join(&new_name);
-    resolve_target(&root, &dst_rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    fs::rename(src_canonical, dst).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("rename failed: {e}"))),
-        )
-    })?;
-    audit_log(
-        &state,
-        &actor,
-        ip,
-        "file_rename",
-        Some(src_rel),
-        true,
-        Some(format!("new_path={dst_rel}")),
-    );
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "path": dst_rel }),
-    )))
-}
-
-pub async fn delete(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Json(req): Json<DeleteRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (actor, ip) = ensure_allowed(&state, &headers, client)?;
-    let root = canonical_root_dir(&state)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::err(e))))?;
-    let rel = rel_to_string(
-        &normalize_rel_path(&req.path)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?,
-    );
-    if rel.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err("cannot delete root")),
-        ));
-    }
-    let target = resolve_target(&root, &rel)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let target = canonicalize_in_root(&root, &target)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ApiResponse::err(e))))?;
-    let meta = fs::metadata(&target).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::err(format!("stat target failed: {e}"))),
-        )
-    })?;
-    if meta.is_dir() {
-        fs::remove_dir_all(&target).await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::err(format!("delete directory failed: {e}"))),
-            )
-        })?;
-    } else {
-        fs::remove_file(&target).await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::err(format!("delete file failed: {e}"))),
-            )
-        })?;
-    }
-    audit_log(
-        &state,
-        &actor,
-        ip,
-        "file_delete",
-        Some(rel.clone()),
-        true,
-        None,
-    );
-    Ok(Json(ApiResponse::ok(serde_json::json!({ "path": rel }))))
-}
-
 // ── HTTP streaming download ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1083,8 +714,6 @@ fn err_response(status: StatusCode, msg: &str) -> Response {
 /// The token is obtained via the `file.download.token` WS RPC.
 pub async fn download_file(
     State(state): State<SharedState>,
-    _headers: HeaderMap,
-    _client: Option<axum::extract::ConnectInfo<SocketAddr>>,
     Query(q): Query<DownloadQuery>,
 ) -> Response {
     let token = match q.token.as_deref().filter(|s| !s.is_empty()) {
@@ -1126,7 +755,7 @@ pub async fn download_file(
 
     if entry.is_dir {
         let filename = format!("{}.tar.gz", name);
-        let disposition = format!("attachment; filename=\"{}\"", filename);
+        let disposition = content_disposition_attachment(&filename);
         let dir_label = name.clone();
         let target_owned = target.clone();
 
@@ -1160,7 +789,7 @@ pub async fn download_file(
 
     if entry.compress {
         let filename = format!("{}.gz", name);
-        let disposition = format!("attachment; filename=\"{}\"", filename);
+        let disposition = content_disposition_attachment(&filename);
         let file = match tokio::fs::File::open(target).await {
             Ok(f) => f,
             Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open: {e}")),
@@ -1181,7 +810,7 @@ pub async fn download_file(
 
     // Raw streaming download
     let filename = name;
-    let disposition = format!("attachment; filename=\"{}\"", filename);
+    let disposition = content_disposition_attachment(&filename);
     let file_size = meta.len();
     let file = match tokio::fs::File::open(target).await {
         Ok(f) => f,
