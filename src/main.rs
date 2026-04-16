@@ -320,6 +320,7 @@ fn build_state(
         ws_noise: !cli.disable_ws_noise,
         token_store: std::sync::Mutex::new(std::collections::HashMap::new()),
         login_limiter: std::sync::Mutex::new(std::collections::HashMap::new()),
+        download_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         tls_enabled: cli.ssl_cert.is_some(),
         audit_logger,
         ip_whitelist,
@@ -532,6 +533,24 @@ async fn main() -> anyhow::Result<()> {
         };
         if let Ok(canonical) = std::fs::canonicalize(&root) {
             fs_watch::spawn_watcher(canonical, state.fs_change_tx.clone());
+        }
+
+        // Periodic cleanup of expired download tokens (every 60 seconds)
+        {
+            let st = state.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Ok(mut map) = st.download_tokens.lock() {
+                        map.retain(|_, v| v.expires_at > now);
+                    }
+                }
+            });
         }
     }
     info!(

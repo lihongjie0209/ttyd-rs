@@ -675,9 +675,9 @@ async function downloadSelected() {
             if (choice === 'cancel') return;
             compress = choice === 'compress';
         }
-        const params = new URLSearchParams({ path: selectedPath });
-        if (compress) params.set('compress', '1');
-        window.open(`/download?${params.toString()}`, '_blank');
+        // Get a single-use download token (path validation + auth happens here, not at download time)
+        const { token } = await wsRpc<{ token: string }>('file.download.token', { path: selectedPath, compress });
+        window.open(`/download?token=${encodeURIComponent(token)}`, '_blank');
     } catch (e) {
         await uiAlert(String(e), '下载失败');
     }

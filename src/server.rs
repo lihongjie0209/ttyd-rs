@@ -2,6 +2,7 @@ use crate::audit::AuditLogger;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::AtomicI32;
 use std::time::Instant;
@@ -13,11 +14,24 @@ pub const TOKEN_TTL_SECS: u64 = 86_400;
 pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
 /// Lock-out duration in seconds (15 min)
 pub const LOGIN_LOCKOUT_SECS: u64 = 900;
+/// Download token TTL (5 minutes, single-use)
+pub const DOWNLOAD_TOKEN_TTL_SECS: u64 = 300;
 
 /// An active session token stored server-side
 pub struct TokenEntry {
     pub username: String,
     pub expires_at: Instant,
+}
+
+/// A pre-validated, single-use file download token
+pub struct DownloadTokenEntry {
+    /// Absolute path already canonicalized and validated against root
+    pub abs_path: PathBuf,
+    pub is_dir: bool,
+    pub compress: bool,
+    /// UNIX timestamp (seconds) after which this token expires
+    pub expires_at: u64,
+    pub actor: String,
 }
 
 /// Per-IP login attempt state
@@ -96,6 +110,8 @@ pub struct ServerState {
     pub token_store: StdMutex<HashMap<String, TokenEntry>>,
     /// Per-IP login attempt tracking for brute-force protection
     pub login_limiter: StdMutex<HashMap<IpAddr, LoginAttempts>>,
+    /// Single-use download tokens: token → DownloadTokenEntry
+    pub download_tokens: StdMutex<HashMap<String, DownloadTokenEntry>>,
     /// Whether the server is listening with TLS (used to set Secure cookie flag)
     pub tls_enabled: bool,
     /// Optional JSONL audit log sink

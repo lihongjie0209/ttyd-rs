@@ -7,20 +7,19 @@ use axum::{
     response::Response,
     Json,
 };
+use async_compression::tokio::bufread::GzipEncoder;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio_util::io::ReaderStream;
-use zip::write::FileOptions;
 
-use crate::{audit::AuditEvent, http::check_auth, server::SharedState};
+use crate::{audit::AuditEvent, http::check_auth, server::{DownloadTokenEntry, SharedState, DOWNLOAD_TOKEN_TTL_SECS}};
 
 const MAX_RPC_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// Files above this size (50 MB) are offered gzip compression on the frontend
@@ -255,10 +254,27 @@ fn download_name(rel: &str, is_dir: bool) -> String {
     let base = rel.rsplit('/').next().unwrap_or("").trim();
     let safe = if base.is_empty() { "download" } else { base };
     if is_dir {
-        format!("{safe}.zip")
+        format!("{safe}.tar.gz")
     } else {
         safe.to_string()
     }
+}
+
+/// A `std::io::Write` adapter that forwards bytes to a tokio `DuplexStream`
+/// by blocking on the current tokio runtime handle.
+/// Must only be used inside `spawn_blocking`.
+struct SyncDuplexWriter {
+    inner: tokio::io::DuplexStream,
+    handle: tokio::runtime::Handle,
+}
+
+impl std::io::Write for SyncDuplexWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.handle
+            .block_on(self.inner.write_all(buf))
+            .map(|_| buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
 fn make_temp_zip_path() -> PathBuf {
@@ -269,61 +285,7 @@ fn make_temp_zip_path() -> PathBuf {
     std::env::temp_dir().join(format!("ttyd-rs-download-{}-{millis}.zip", std::process::id()))
 }
 
-fn zip_dir_recursive(
-    writer: &mut zip::ZipWriter<std::fs::File>,
-    root_dir: &Path,
-    current_dir: &Path,
-) -> Result<(), String> {
-    let mut entries: Vec<_> = std::fs::read_dir(current_dir)
-        .map_err(|e| format!("read directory failed: {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("read directory entry failed: {e}"))?;
-    entries.sort_by_key(|e| e.file_name().to_string_lossy().to_string());
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-    for entry in entries {
-        let path = entry.path();
-        let file_type = std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("read metadata failed: {e}"))?
-            .file_type();
-        if file_type.is_symlink() {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root_dir)
-            .map_err(|e| format!("resolve relative path failed: {e}"))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if file_type.is_dir() {
-            writer
-                .add_directory(format!("{rel}/"), options)
-                .map_err(|e| format!("zip add directory failed: {e}"))?;
-            zip_dir_recursive(writer, root_dir, &path)?;
-            continue;
-        }
-        if file_type.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| format!("read file failed: {e}"))?;
-            writer
-                .start_file(rel, options)
-                .map_err(|e| format!("zip add file failed: {e}"))?;
-            writer
-                .write_all(&bytes)
-                .map_err(|e| format!("zip write file failed: {e}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn create_temp_zip_from_dir(dir: &Path) -> Result<PathBuf, String> {
-    let zip_path = make_temp_zip_path();
-    let file = std::fs::File::create(&zip_path).map_err(|e| format!("create zip failed: {e}"))?;
-    let mut writer = zip::ZipWriter::new(file);
-    zip_dir_recursive(&mut writer, dir, dir)?;
-    writer
-        .finish()
-        .map_err(|e| format!("finalize zip failed: {e}"))?;
-    Ok(zip_path)
-}
+#[allow(dead_code)]
 
 async fn list_entries(root: &Path, rel_path: &str) -> Result<Vec<FileEntry>, String> {
     let dir_path = resolve_target(root, rel_path)?;
@@ -618,6 +580,8 @@ pub async fn handle_ws_rpc(
             Ok(serde_json::json!({ "path": target_rel, "size": bytes.len() }))
         }
         "file.download" => {
+            // Deprecated: use GET /download?path=... HTTP endpoint instead (no size limit, streaming).
+            // Kept for backward-compat; returns file size + redirect info for small files only.
             let root = canonical_root_dir(state)?;
             let rel = rel_to_string(&normalize_rel_path(
                 params
@@ -634,38 +598,15 @@ pub async fn handle_ws_rpc(
                 .await
                 .map_err(|e| format!("stat target failed: {e}"))?;
             let is_dir = meta.is_dir();
-            let name = download_name(&rel, is_dir);
-            let bytes = if is_dir {
-                let target_for_zip = target.clone();
-                let zip_path = tokio::task::spawn_blocking(move || create_temp_zip_from_dir(&target_for_zip))
-                    .await
-                    .map_err(|e| format!("zip task failed: {e}"))??;
-                let zip_meta = fs::metadata(&zip_path)
-                    .await
-                    .map_err(|e| format!("stat zip failed: {e}"))?;
-                if zip_meta.len() > MAX_RPC_FILE_BYTES as u64 {
-                    let _ = fs::remove_file(&zip_path).await;
-                    return Err(format!(
-                        "archive too large, max {} bytes",
-                        MAX_RPC_FILE_BYTES
-                    ));
-                }
-                let bytes = fs::read(&zip_path)
-                    .await
-                    .map_err(|e| format!("read zip failed: {e}"))?;
-                let _ = fs::remove_file(&zip_path).await;
-                bytes
-            } else {
-                if meta.len() > MAX_RPC_FILE_BYTES as u64 {
-                    return Err(format!(
-                        "file too large, max {} bytes",
-                        MAX_RPC_FILE_BYTES
-                    ));
-                }
-                fs::read(&target)
-                    .await
-                    .map_err(|e| format!("read file failed: {e}"))?
-            };
+            if is_dir || meta.len() > MAX_RPC_FILE_BYTES as u64 {
+                return Err(format!(
+                    "use HTTP endpoint: GET /download?path={rel}"
+                ));
+            }
+            let name = download_name(&rel, false);
+            let bytes = fs::read(&target)
+                .await
+                .map_err(|e| format!("read file failed: {e}"))?;
             audit_log(
                 state,
                 actor,
@@ -673,13 +614,13 @@ pub async fn handle_ws_rpc(
                 "file_download",
                 Some(rel.clone()),
                 true,
-                Some(format!("size={}, dir={}", bytes.len(), is_dir)),
+                Some(format!("size={}", bytes.len())),
             );
             Ok(serde_json::json!({
                 "path": rel,
                 "name": name,
                 "size": bytes.len(),
-                "is_dir": is_dir,
+                "is_dir": false,
                 "content_base64": STANDARD.encode(bytes),
             }))
         }
@@ -795,6 +736,67 @@ pub async fn handle_ws_rpc(
                 "size": meta.len(),
                 "is_dir": meta.is_dir(),
             }))
+        }
+        "file.download.token" => {
+            // Generate a single-use, time-limited download token for a pre-validated path.
+            // The token is returned to the authenticated WS client; no path info leaks in the URL.
+            let root = canonical_root_dir(state)?;
+            let rel = rel_to_string(&normalize_rel_path(
+                params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            )?);
+            if rel.is_empty() {
+                return Err("path is required".to_string());
+            }
+            let target = resolve_target(&root, &rel)?;
+            let target = canonicalize_in_root(&root, &target)?;
+            let meta = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("stat failed: {e}"))?;
+            let is_dir = meta.is_dir();
+            let compress = params
+                .get("compress")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            // Generate random 32-hex-char token
+            use rand_core::RngCore;
+            let mut bytes = [0u8; 16];
+            rand_core::OsRng.fill_bytes(&mut bytes);
+            let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+            let expires_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + DOWNLOAD_TOKEN_TTL_SECS;
+
+            let entry = DownloadTokenEntry {
+                abs_path: target,
+                is_dir,
+                compress,
+                expires_at,
+                actor: actor.to_string(),
+            };
+
+            state
+                .download_tokens
+                .lock()
+                .map_err(|_| "lock poisoned".to_string())?
+                .insert(token.clone(), entry);
+
+            audit_log(
+                state,
+                actor,
+                ip,
+                "download_token_issued",
+                Some(rel),
+                true,
+                Some(format!("ttl={DOWNLOAD_TOKEN_TTL_SECS},compress={compress}")),
+            );
+            Ok(serde_json::json!({ "token": token }))
         }
         "health.live" => Ok(serde_json::json!({ "status": "ok" })),
         "health.ready" => {
@@ -1065,9 +1067,7 @@ pub async fn delete(
 
 #[derive(Deserialize)]
 pub struct DownloadQuery {
-    pub path: Option<String>,
-    /// "1" = gzip-compress the file before sending
-    pub compress: Option<String>,
+    pub token: Option<String>,
 }
 
 fn err_response(status: StatusCode, msg: &str) -> Response {
@@ -1078,135 +1078,118 @@ fn err_response(status: StatusCode, msg: &str) -> Response {
         .unwrap()
 }
 
-/// `GET /download?path=<rel>&compress=0|1`
-/// Streams files (and directories as zip) directly without the 8 MB WS limit.
-/// Supports optional gzip compression for single files via `?compress=1`.
+/// `GET /download?token=<token>`
+/// Single-use, pre-authenticated streaming download.
+/// The token is obtained via the `file.download.token` WS RPC.
 pub async fn download_file(
     State(state): State<SharedState>,
-    headers: HeaderMap,
-    client: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    _headers: HeaderMap,
+    _client: Option<axum::extract::ConnectInfo<SocketAddr>>,
     Query(q): Query<DownloadQuery>,
 ) -> Response {
-    let ip = client.map(|c| c.0.ip());
-    let actor = match check_auth(&headers, &state) {
-        Some(u) => u,
-        None => return err_response(StatusCode::UNAUTHORIZED, "unauthorized"),
+    let token = match q.token.as_deref().filter(|s| !s.is_empty()) {
+        Some(t) => t.to_string(),
+        None => return err_response(StatusCode::BAD_REQUEST, "token is required"),
     };
 
-    let rel = match q.path.as_deref().filter(|s| !s.is_empty()) {
-        Some(p) => match normalize_rel_path(p) {
-            Ok(n) => rel_to_string(&n),
-            Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
-        },
-        None => return err_response(StatusCode::BAD_REQUEST, "path is required"),
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Consume the token (single-use)
+    let entry = match state.download_tokens.lock() {
+        Ok(mut map) => {
+            match map.remove(&token) {
+                Some(e) => e,
+                None => return err_response(StatusCode::NOT_FOUND, "invalid or expired token"),
+            }
+        }
+        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "lock error"),
     };
-    if rel.is_empty() {
-        return err_response(StatusCode::BAD_REQUEST, "path is required");
+
+    if entry.expires_at < now {
+        return err_response(StatusCode::GONE, "download token has expired");
     }
 
-    let root = match canonical_root_dir(&state) {
-        Ok(r) => r,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
-    };
-
-    let target = match resolve_target(&root, &rel) {
-        Ok(t) => t,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
-    };
-    let target = match canonicalize_in_root(&root, &target) {
-        Ok(t) => t,
-        Err(e) => return err_response(StatusCode::BAD_REQUEST, &e),
-    };
-
-    let meta = match fs::metadata(&target).await {
+    let target = &entry.abs_path;
+    let meta = match fs::metadata(target).await {
         Ok(m) => m,
         Err(e) => return err_response(StatusCode::NOT_FOUND, &format!("stat failed: {e}")),
     };
 
-    let compress = q.compress.as_deref() == Some("1");
-    let is_dir = meta.is_dir();
+    let rel = target.to_string_lossy().to_string();
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
 
-    if is_dir {
-        // Directories: always zip regardless of compress flag
-        let zip_path = match tokio::task::spawn_blocking({
-            let t = target.clone();
-            move || create_temp_zip_from_dir(&t)
-        })
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("zip task: {e}")),
-        };
-
-        let filename = download_name(&rel, true);
+    if entry.is_dir {
+        let filename = format!("{}.tar.gz", name);
         let disposition = format!("attachment; filename=\"{}\"", filename);
-        let zip_file = match tokio::fs::File::open(&zip_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&zip_path).await;
-                return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open zip: {e}"));
+        let dir_label = name.clone();
+        let target_owned = target.clone();
+
+        let (async_write, async_read) = tokio::io::duplex(256 * 1024);
+        let handle = tokio::runtime::Handle::current();
+
+        let _tar_task = tokio::task::spawn_blocking(move || {
+            let writer = SyncDuplexWriter { inner: async_write, handle };
+            let mut archive = tar::Builder::new(writer);
+            if let Err(e) = archive.append_dir_all(&dir_label, &target_owned) {
+                tracing::warn!("tar error: {e}");
+                return;
             }
-        };
-        let stream = ReaderStream::new(zip_file);
-        // Clean up temp file after open (OS keeps file alive until closed on Unix)
-        // On Windows we can't delete while open — best effort
-        let _ = tokio::fs::remove_file(&zip_path).await;
+            if let Err(e) = archive.finish() {
+                tracing::warn!("tar finish error: {e}");
+            }
+        });
 
-        audit_log(&state, &actor, ip, "file_download", Some(rel), true, Some("dir=true".into()));
+        let encoder = GzipEncoder::new(BufReader::new(async_read));
+        let stream = ReaderStream::new(encoder);
 
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/zip")
-            .header(header::CONTENT_DISPOSITION, disposition)
-            .body(Body::from_stream(stream))
-            .unwrap();
-    }
-
-    if compress {
-        // Gzip: compress in blocking task, then stream
-        let filename = format!("{}.gz", download_name(&rel, false));
-        let disposition = format!("attachment; filename=\"{}\"", filename);
-        let target_clone = target.clone();
-        let gz_bytes = match tokio::task::spawn_blocking(move || {
-            use flate2::{write::GzEncoder, Compression};
-            let data = std::fs::read(&target_clone)
-                .map_err(|e| format!("read failed: {e}"))?;
-            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-            enc.write_all(&data).map_err(|e| format!("compress failed: {e}"))?;
-            enc.finish().map_err(|e| format!("finalize failed: {e}"))
-        })
-        .await
-        {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &e),
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("task: {e}")),
-        };
-
-        let size = gz_bytes.len();
-        audit_log(&state, &actor, ip, "file_download", Some(rel), true,
-            Some(format!("size={size},compressed=true")));
+        audit_log(&state, &entry.actor, None, "file_download", Some(rel), true, Some("dir=true,fmt=tar.gz".into()));
 
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/gzip")
             .header(header::CONTENT_DISPOSITION, disposition)
-            .header(header::CONTENT_LENGTH, size)
-            .body(Body::from(gz_bytes))
+            .body(Body::from_stream(stream))
             .unwrap();
     }
 
-    // Raw streaming download — no size limit, no buffering
-    let filename = download_name(&rel, false);
+    if entry.compress {
+        let filename = format!("{}.gz", name);
+        let disposition = format!("attachment; filename=\"{}\"", filename);
+        let file = match tokio::fs::File::open(target).await {
+            Ok(f) => f,
+            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open: {e}")),
+        };
+        let encoder = GzipEncoder::new(BufReader::new(file));
+        let stream = ReaderStream::new(encoder);
+
+        audit_log(&state, &entry.actor, None, "file_download", Some(rel), true,
+            Some(format!("size={},compressed=true", meta.len())));
+
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(header::CONTENT_DISPOSITION, disposition)
+            .body(Body::from_stream(stream))
+            .unwrap();
+    }
+
+    // Raw streaming download
+    let filename = name;
     let disposition = format!("attachment; filename=\"{}\"", filename);
     let file_size = meta.len();
-    let file = match tokio::fs::File::open(&target).await {
+    let file = match tokio::fs::File::open(target).await {
         Ok(f) => f,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("open: {e}")),
     };
     let stream = ReaderStream::new(file);
 
-    audit_log(&state, &actor, ip, "file_download", Some(rel), true,
+    audit_log(&state, &entry.actor, None, "file_download", Some(rel), true,
         Some(format!("size={file_size},compressed=false")));
 
     Response::builder()
