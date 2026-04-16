@@ -5,15 +5,28 @@
 **Share your terminal over the web — a Rust rewrite of [ttyd](https://github.com/tsl0922/ttyd)**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/lihongjie0209/ttyd-rs/release.yml?style=flat-square)](https://github.com/lihongjie0209/ttyd-rs/actions)
+[![Release](https://img.shields.io/github/v/release/lihongjie0209/ttyd-rs?style=flat-square)](https://github.com/lihongjie0209/ttyd-rs/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-brightgreen?style=flat-square)](#platform-support)
 
-A single self-contained binary that exposes any shell in your browser via WebSocket. Dark-themed xterm.js UI, built-in file browser, end-to-end Noise encryption, and audit logging — zero runtime dependencies.
+A single self-contained binary that exposes any shell in your browser via WebSocket. Dark-themed xterm.js UI, Monaco-based inline file editor, built-in file browser, end-to-end Noise encryption, and audit logging — zero runtime dependencies.
 
 [Quick Start](#quick-start) · [Features](#features) · [Windows](#windows) · [Docker](#docker) · [Nginx](#nginx-reverse-proxy) · [Security](docs/SECURITY.md)
 
 </div>
+
+---
+
+## Download
+
+Pre-built binaries are available on the [Releases](https://github.com/lihongjie0209/ttyd-rs/releases/latest) page:
+
+| Platform | File |
+|----------|------|
+| Linux x64 | `ttyd-linux-x64.tar.gz` |
+| macOS x64 | `ttyd-macos-x64.tar.gz` |
+| Windows x64 | `ttyd.exe` |
 
 ---
 
@@ -36,10 +49,13 @@ A single self-contained binary that exposes any shell in your browser via WebSoc
 | **PTY over WebSocket** | Full xterm.js terminal rendered in any browser |
 | **Cross-platform** | Runs on Linux, macOS, and **Windows** (cmd / PowerShell / WSL) |
 | **Auth-gated login** | Login page shown when `--credential` is set; terminal hidden until authenticated |
-| **File browser** | List, upload, download (dirs as `.zip`), rename, delete, new file/dir, right-click menu |
+| **File browser** | List, upload, download, rename, delete, new file/dir, right-click context menu |
+| **Inline file editor** | Double-click any file to edit it in a Monaco (VSCode) editor with syntax highlighting |
+| **Filesystem watch** | Server watches for file/directory changes and pushes live updates to the browser tree |
+| **Smart download** | Files >50 MB prompt for gzip compression; directories stream as `.tar.gz` (no blocking) |
 | **WS Noise encryption** | `Noise_NN_25519_ChaChaPoly_SHA256` enabled by default — no TLS cert required |
 | **Basic Auth & proxy auth** | `-c user:pass` or delegate to upstream via `--auth-header` |
-| **IP allowlist** | CIDR-based filtering with `--allow-ip` |
+| **IP allowlist** | CIDR-based filtering with `--ip-whitelist` |
 | **lrzsz transfer** | `rz`/`sz` file transfer with first-login hint |
 | **Audit log** | JSONL structured log of every connection, command, and file operation |
 | **Sub-path mount** | `--base-path` for reverse-proxy deployments |
@@ -49,6 +65,15 @@ A single self-contained binary that exposes any shell in your browser via WebSoc
 ---
 
 ## Quick Start
+
+### Using a pre-built binary
+
+```bash
+# Download from https://github.com/lihongjie0209/ttyd-rs/releases/latest
+./ttyd -c admin:admin --port 7681 bash
+```
+
+### Build from source
 
 ```bash
 # Linux / macOS
@@ -320,8 +345,12 @@ Covers: auth, IP allowlist, file API CRUD, path-traversal rejection, WS regressi
 GitHub Actions (`.github/workflows/release.yml`):
 
 - Triggers on `v*` tag push or manual dispatch
-- Builds on `ubuntu-latest` and `macos-latest`
-- Artifacts: `ttyd-${platform}.tar.gz` uploaded to GitHub Releases
+- Builds on `ubuntu-latest`, `macos-latest`, and `windows-latest`
+- Artifacts uploaded to GitHub Releases:
+  - `ttyd-linux-x64.tar.gz`
+  - `ttyd-macos-x64.tar.gz`
+  - `ttyd.exe` (Windows)
+- Docker images pushed to DockerHub: `lihongjie0209/ttyd-rs` and `lihongjie0209/ttyd-rs-ubuntu`
 
 ---
 
@@ -354,7 +383,7 @@ ttyd-rs applies multiple layers of hardening:
 
 - Always set a strong `--credential` and run behind a TLS-terminating reverse proxy.
 - Bind to `localhost` and let nginx handle public exposure.
-- Enable `--allow-ip` to restrict access to known CIDRs.
+- Enable `--ip-whitelist` to restrict access to known CIDRs.
 - Enable `--audit-log` for a JSONL record of all connections and file operations.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for the complete audit report, threat model, and deferred items.

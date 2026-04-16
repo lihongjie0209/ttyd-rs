@@ -27,7 +27,7 @@ This document records the security architecture of ttyd-rs, the full findings fr
 | Login form | Username + password (base64-encoded in config, checked in constant-time) | Enabled only when `--credential` is set |
 | Session cookie | 32-byte random token, `HttpOnly; SameSite=Lax; Max-Age=86400` (+ `Secure` when TLS) | Stored in `token_store` with 24-hour TTL |
 | WebSocket upgrade | Auth checked at WS handshake before any PTY is opened | Same token store |
-| IP allowlist | CIDR filtering via `--allow-ip` (applied before auth) | Optional, off by default |
+| IP allowlist | CIDR filtering via `--ip-whitelist` (applied before auth) | Optional, off by default |
 | Proxy auth | `--auth-header` delegates to upstream (e.g., nginx `auth_basic`) | Optional |
 
 ### Path security (file browser)
@@ -197,7 +197,7 @@ Internet
     │
     ▼
 [ttyd-rs]
-    ├── IP allowlist (--allow-ip)
+    ├── IP allowlist (--ip-whitelist)
     ├── Login + session cookie (--credential)
     ├── Brute-force lockout (5 failures → 15 min)
     ├── Security headers middleware
