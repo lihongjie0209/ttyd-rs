@@ -11,7 +11,7 @@
 
 A single self-contained binary that exposes any shell in your browser via WebSocket. Dark-themed xterm.js UI, built-in file browser, end-to-end Noise encryption, and audit logging — zero runtime dependencies.
 
-[Quick Start](#quick-start) · [Features](#features) · [Windows](#windows) · [Docker](#docker) · [Nginx](#nginx-reverse-proxy) · [Security](#security-notes)
+[Quick Start](#quick-start) · [Features](#features) · [Windows](#windows) · [Docker](#docker) · [Nginx](#nginx-reverse-proxy) · [Security](docs/SECURITY.md)
 
 </div>
 
@@ -335,8 +335,26 @@ GitHub Actions (`.github/workflows/release.yml`):
 
 ---
 
-## Security Notes
+## Security
 
-- **WS Noise (Noise_NN)** encrypts the WebSocket payload but does **not** authenticate the server identity. Use HTTPS/TLS termination in production.
-- Always set a strong `--credential` and restrict network access with `--allow-ip` or a reverse proxy.
-- Run ttyd-rs bound to `localhost` only and let nginx handle public-facing TLS.
+> **Full details:** [docs/SECURITY.md](docs/SECURITY.md)
+
+ttyd-rs applies multiple layers of hardening:
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Auth** | Login + session cookie (`HttpOnly; SameSite=Lax`), brute-force lockout (5 failures → 15 min) |
+| **Path security** | Lexical `..` rejection + symlink-resolving `canonicalize_in_root` on every file operation |
+| **Download tokens** | Single-use, 30-second tokens — no raw paths in download URLs |
+| **Security headers** | `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, HSTS (TLS mode) |
+| **Body limits** | Login: 8 KB · Global HTTP: 16 MB · WS RPC: 16 MB |
+| **Encryption** | WS Noise (`Noise_NN_25519_ChaChaPoly_SHA256`) enabled by default |
+
+**Production recommendations:**
+
+- Always set a strong `--credential` and run behind a TLS-terminating reverse proxy.
+- Bind to `localhost` and let nginx handle public exposure.
+- Enable `--allow-ip` to restrict access to known CIDRs.
+- Enable `--audit-log` for a JSONL record of all connections and file operations.
+
+See [docs/SECURITY.md](docs/SECURITY.md) for the complete audit report, threat model, and deferred items.
