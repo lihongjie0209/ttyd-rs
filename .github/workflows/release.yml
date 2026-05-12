@@ -52,6 +52,7 @@ jobs:
         with:
           name: ttyd-${{ matrix.platform }}
           path: ttyd-${{ matrix.platform }}.tar.gz
+          retention-days: 1
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -90,6 +91,7 @@ jobs:
         with:
           name: ttyd-windows-x64
           path: target\release\ttyd.exe
+          retention-days: 1
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
